@@ -43,4 +43,16 @@ pub enum Error {
 
     #[error("queue is suspended: {0}")]
     QueueSuspended(String),
+
+    #[error("queue is closed: {0}")]
+    QueueClosed(String),
+
+    #[error("queue is not opened for writing: {0}")]
+    QueueReadOnly(String),
+
+    #[error("message payload must not be empty")]
+    EmptyPayload,
+
+    #[error("queue requires a correlation id for every message: {0}")]
+    MissingCorrelationId(String),
 }

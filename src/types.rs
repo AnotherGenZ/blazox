@@ -419,6 +419,16 @@ impl QueueOptions {
         })
     }
 
+    pub(crate) fn initial_queue_stream_parameters(&self) -> QueueStreamParameters {
+        QueueStreamParameters {
+            sub_id_info: None,
+            max_unconfirmed_messages: self.max_unconfirmed_messages.unwrap_or_default(),
+            max_unconfirmed_bytes: self.max_unconfirmed_bytes.unwrap_or_default(),
+            consumer_priority: self.consumer_priority.unwrap_or(i32::MIN),
+            consumer_priority_count: self.consumer_priority_count.unwrap_or_default(),
+        }
+    }
+
     pub(crate) fn stream_parameters(&self) -> Option<StreamParameters> {
         if self.app_id.is_none() && self.subscriptions.is_empty() {
             return None;
@@ -441,7 +451,7 @@ impl QueueOptions {
                 write_count: self.write_count,
                 admin_count: self.admin_count,
             },
-            configure_queue_stream: self.default_queue_stream_parameters(),
+            configure_queue_stream: Some(self.initial_queue_stream_parameters()),
             configure_stream: self.stream_parameters(),
         }
     }
@@ -872,5 +882,15 @@ mod tests {
             mapped.configure_stream.as_ref().unwrap().app_id,
             "consumer-a"
         );
+    }
+
+    #[test]
+    fn writer_open_options_still_include_initial_queue_stream_config() {
+        let mapped = QueueOptions::writer().to_open_queue_options();
+        let stream = mapped.configure_queue_stream.unwrap();
+        assert_eq!(stream.max_unconfirmed_messages, 0);
+        assert_eq!(stream.max_unconfirmed_bytes, 0);
+        assert_eq!(stream.consumer_priority, i32::MIN);
+        assert_eq!(stream.consumer_priority_count, 0);
     }
 }

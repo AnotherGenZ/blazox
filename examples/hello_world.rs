@@ -80,6 +80,12 @@ fn print_session_event(event: SessionEvent) {
         SessionEvent::QueueClosed { uri } => info!(%uri, "queue closed"),
         SessionEvent::QueueSuspended { uri } => warn!(%uri, "queue suspended"),
         SessionEvent::QueueResumed { uri } => info!(%uri, "queue resumed"),
+        SessionEvent::SlowConsumerHighWatermark { pending } => {
+            warn!(pending, "session event queue reached high watermark")
+        }
+        SessionEvent::SlowConsumerNormal { pending } => {
+            info!(pending, "session event queue returned to normal")
+        }
         SessionEvent::Schema(schema) => info!(schema = ?schema, "session schema event"),
     }
 }

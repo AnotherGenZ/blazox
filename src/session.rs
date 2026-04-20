@@ -13,10 +13,10 @@ use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::Duration;
-use tokio::sync::{Mutex, broadcast, watch};
+use tokio::sync::{Mutex, broadcast, mpsc, watch};
 use tokio::time::{sleep, timeout};
 use tracing::info;
 
@@ -34,6 +34,8 @@ pub enum SessionEvent {
     QueueClosed { uri: Uri },
     QueueSuspended { uri: Uri },
     QueueResumed { uri: Uri },
+    SlowConsumerHighWatermark { pending: usize },
+    SlowConsumerNormal { pending: usize },
     Schema(InboundSchemaEvent),
 }
 
@@ -171,8 +173,10 @@ struct SessionInner {
     closed: AtomicBool,
     started: AtomicBool,
     events: broadcast::Sender<SessionEvent>,
+    event_tx: mpsc::UnboundedSender<SessionEvent>,
     connection: watch::Sender<ConnectionState>,
     message_dumping: Mutex<MessageDumpState>,
+    watermark_monitor: Arc<EventWatermarkMonitor>,
 }
 
 struct QueueState {
@@ -185,6 +189,8 @@ struct QueueState {
     suspended: AtomicBool,
     closed: AtomicBool,
     events: broadcast::Sender<QueueEvent>,
+    event_tx: mpsc::UnboundedSender<QueueEvent>,
+    watermark_monitor: Arc<EventWatermarkMonitor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,6 +199,55 @@ enum MessageDumpState {
     On,
     Remaining(usize),
     Until(tokio::time::Instant),
+}
+
+struct EventWatermarkMonitor {
+    pending: AtomicUsize,
+    in_high_watermark: AtomicBool,
+    low_watermark: usize,
+    high_watermark: usize,
+    session_events: broadcast::Sender<SessionEvent>,
+}
+
+impl EventWatermarkMonitor {
+    fn new(
+        low_watermark: usize,
+        high_watermark: usize,
+        session_events: broadcast::Sender<SessionEvent>,
+    ) -> Self {
+        Self {
+            pending: AtomicUsize::new(0),
+            in_high_watermark: AtomicBool::new(false),
+            low_watermark,
+            high_watermark: high_watermark.max(1),
+            session_events,
+        }
+    }
+
+    fn on_enqueue(&self) {
+        let pending = self.pending.fetch_add(1, Ordering::SeqCst) + 1;
+        if pending < self.high_watermark {
+            return;
+        }
+        if !self.in_high_watermark.swap(true, Ordering::SeqCst) {
+            let _ = self
+                .session_events
+                .send(SessionEvent::SlowConsumerHighWatermark { pending });
+        }
+    }
+
+    fn on_dequeue(&self) {
+        let previous = self.pending.fetch_sub(1, Ordering::SeqCst);
+        let pending = previous.saturating_sub(1);
+        if !self.in_high_watermark.load(Ordering::SeqCst) || pending > self.low_watermark {
+            return;
+        }
+        if self.in_high_watermark.swap(false, Ordering::SeqCst) {
+            let _ = self
+                .session_events
+                .send(SessionEvent::SlowConsumerNormal { pending });
+        }
+    }
 }
 
 impl Session {
@@ -204,6 +259,13 @@ impl Session {
         let event_capacity = options.event_queue_capacity();
         let guid_generator = options.to_client_config().message_guid_generator();
         let (events, _) = broadcast::channel(event_capacity);
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let watermark_monitor = Arc::new(EventWatermarkMonitor::new(
+            options.event_queue_low_watermark,
+            options.event_queue_high_watermark,
+            events.clone(),
+        ));
+        spawn_session_event_dispatcher(event_rx, events.clone(), watermark_monitor.clone());
         let (connection, _) = watch::channel(ConnectionState::Connecting);
         let inner = Arc::new(SessionInner {
             options,
@@ -218,8 +280,10 @@ impl Session {
             closed: AtomicBool::new(false),
             started: AtomicBool::new(false),
             events,
+            event_tx,
             connection,
             message_dumping: Mutex::new(MessageDumpState::Off),
+            watermark_monitor,
         });
 
         let client = inner.establish_client().await?;
@@ -326,6 +390,12 @@ impl Session {
         let uri = Uri::parse(uri.as_ref())?;
         let handle = self.inner.open_queue_with_retry(&uri, &options).await?;
         let (events, _) = broadcast::channel(self.inner.options.event_queue_capacity());
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        spawn_queue_event_dispatcher(
+            event_rx,
+            events.clone(),
+            self.inner.watermark_monitor.clone(),
+        );
         let state = Arc::new(QueueState {
             key: self.inner.next_queue_key.fetch_add(1, Ordering::Relaxed),
             uri: uri.clone(),
@@ -336,6 +406,8 @@ impl Session {
             suspended: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             events,
+            event_tx,
+            watermark_monitor: self.inner.watermark_monitor.clone(),
         });
 
         {
@@ -356,7 +428,7 @@ impl Session {
             self.inner.suspend_queue_for_host_health(&state).await?;
         }
 
-        let _ = state.events.send(QueueEvent::Opened {
+        state.enqueue_event(QueueEvent::Opened {
             queue_id: handle.queue_id,
         });
         self.inner.emit_session(SessionEvent::QueueOpened {
@@ -840,7 +912,7 @@ impl SessionInner {
     async fn route_push(&self, message: PushMessage) {
         self.maybe_dump_message("inbound_push", &message).await;
         if let Some(queue) = self.lookup_queue(message.header.queue_id).await {
-            let _ = queue.events.send(QueueEvent::Message(message.into()));
+            queue.enqueue_event(QueueEvent::Message(message.into()));
         }
     }
 
@@ -848,7 +920,7 @@ impl SessionInner {
         self.maybe_dump_message("inbound_ack", &ack).await;
         if let Some(queue) = self.lookup_queue(ack.queue_id).await {
             queue.remove_pending_post(ack.message_guid).await;
-            let _ = queue.events.send(QueueEvent::Ack(ack.into()));
+            queue.enqueue_event(QueueEvent::Ack(ack.into()));
         }
     }
 
@@ -968,7 +1040,7 @@ impl SessionInner {
                 .await
                 .insert(queue.uri.to_string(), queue.key);
 
-            let _ = queue.events.send(QueueEvent::Reopened { queue_id });
+            queue.enqueue_event(QueueEvent::Reopened { queue_id });
             self.emit_session(SessionEvent::QueueReopened {
                 uri: queue.uri.clone(),
                 queue_id,
@@ -991,9 +1063,14 @@ impl SessionInner {
         if messages.is_empty() {
             return Ok(PackedPostBatch::new());
         }
-        if queue.suspended.load(Ordering::SeqCst) {
-            return Err(Error::QueueSuspended(queue.uri.to_string()));
-        }
+        let options = queue.options.lock().await.clone();
+        validate_outbound_posts(
+            &queue.uri,
+            &options,
+            queue.closed.load(Ordering::SeqCst),
+            queue.suspended.load(Ordering::SeqCst),
+            &messages,
+        )?;
 
         let messages = messages
             .into_iter()
@@ -1016,6 +1093,8 @@ impl SessionInner {
         if messages.is_empty() {
             return Ok(());
         }
+        let options = queue.options.lock().await.clone();
+        validate_post_queue_state(&queue.uri, &options, queue.closed.load(Ordering::SeqCst))?;
         queue.buffer_pending_posts(&messages).await;
         self.maybe_dump_message("outbound_put", &messages).await;
         let outbound = messages
@@ -1168,7 +1247,7 @@ impl SessionInner {
                 .await;
         }
 
-        let _ = queue.events.send(QueueEvent::Closed);
+        queue.enqueue_event(QueueEvent::Closed);
         self.emit_session(SessionEvent::QueueClosed {
             uri: queue.uri.clone(),
         });
@@ -1176,7 +1255,10 @@ impl SessionInner {
     }
 
     fn emit_session(&self, event: SessionEvent) {
-        let _ = self.events.send(event);
+        self.watermark_monitor.on_enqueue();
+        if self.event_tx.send(event).is_err() {
+            self.watermark_monitor.on_dequeue();
+        }
     }
 
     async fn open_queue_with_retry(
@@ -1256,7 +1338,7 @@ impl SessionInner {
             return Ok(());
         }
         self.apply_suspended_queue_stream(queue).await?;
-        let _ = queue.events.send(QueueEvent::Suspended);
+        queue.enqueue_event(QueueEvent::Suspended);
         self.emit_session(SessionEvent::QueueSuspended {
             uri: queue.uri.clone(),
         });
@@ -1272,7 +1354,7 @@ impl SessionInner {
         }
         let options = queue.options.lock().await.clone();
         self.apply_queue_configuration(queue, &options).await?;
-        let _ = queue.events.send(QueueEvent::Resumed);
+        queue.enqueue_event(QueueEvent::Resumed);
         self.emit_session(SessionEvent::QueueResumed {
             uri: queue.uri.clone(),
         });
@@ -1352,6 +1434,13 @@ impl QueueState {
         (value != 0).then_some(value)
     }
 
+    fn enqueue_event(&self, event: QueueEvent) {
+        self.watermark_monitor.on_enqueue();
+        if self.event_tx.send(event).is_err() {
+            self.watermark_monitor.on_dequeue();
+        }
+    }
+
     async fn buffer_pending_posts(&self, messages: &[PostMessage]) {
         let mut pending = self.pending_posts.lock().await;
         for message in messages {
@@ -1377,6 +1466,66 @@ impl QueueState {
             pending.remove(index);
         }
     }
+}
+
+fn validate_post_queue_state(uri: &Uri, options: &QueueOptions, closed: bool) -> Result<()> {
+    if closed {
+        return Err(Error::QueueClosed(uri.to_string()));
+    }
+    if !options.flags.contains(crate::types::QueueFlags::WRITE) {
+        return Err(Error::QueueReadOnly(uri.to_string()));
+    }
+    Ok(())
+}
+
+fn validate_outbound_posts(
+    uri: &Uri,
+    options: &QueueOptions,
+    closed: bool,
+    suspended: bool,
+    messages: &[PostMessage],
+) -> Result<()> {
+    validate_post_queue_state(uri, options, closed)?;
+    if suspended {
+        return Err(Error::QueueSuspended(uri.to_string()));
+    }
+    if messages.iter().any(|message| message.payload.is_empty()) {
+        return Err(Error::EmptyPayload);
+    }
+    if options.flags.contains(crate::types::QueueFlags::ACK)
+        && messages
+            .iter()
+            .any(|message| message.correlation_id.is_none())
+    {
+        return Err(Error::MissingCorrelationId(uri.to_string()));
+    }
+    Ok(())
+}
+
+fn spawn_session_event_dispatcher(
+    mut rx: mpsc::UnboundedReceiver<SessionEvent>,
+    events: broadcast::Sender<SessionEvent>,
+    monitor: Arc<EventWatermarkMonitor>,
+) {
+    tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            monitor.on_dequeue();
+            let _ = events.send(event);
+        }
+    });
+}
+
+fn spawn_queue_event_dispatcher(
+    mut rx: mpsc::UnboundedReceiver<QueueEvent>,
+    events: broadcast::Sender<QueueEvent>,
+    monitor: Arc<EventWatermarkMonitor>,
+) {
+    tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            monitor.on_dequeue();
+            let _ = events.send(event);
+        }
+    });
 }
 
 async fn transport_loop(session: Arc<SessionInner>, client: Client) {
@@ -1478,4 +1627,94 @@ fn post_to_outbound(message: PostMessage) -> OutboundPut {
         outbound = outbound.with_message_guid(message_guid);
     }
     outbound
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_outbound_posts_rejects_closed_readonly_empty_and_missing_correlation_id() {
+        let uri = Uri::parse("bmq://bmq.test.mem.priority/example").unwrap();
+
+        let err = validate_outbound_posts(
+            &uri,
+            &QueueOptions::writer(),
+            true,
+            false,
+            &[PostMessage::new("payload")],
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::QueueClosed(_)));
+
+        let err = validate_outbound_posts(
+            &uri,
+            &QueueOptions::reader(),
+            false,
+            false,
+            &[PostMessage::new("payload")],
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::QueueReadOnly(_)));
+
+        let err = validate_outbound_posts(
+            &uri,
+            &QueueOptions::writer(),
+            false,
+            false,
+            &[PostMessage::new(bytes::Bytes::new())],
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::EmptyPayload));
+
+        let err = validate_outbound_posts(
+            &uri,
+            &QueueOptions::writer()
+                .flags(crate::types::QueueFlags::WRITE | crate::types::QueueFlags::ACK),
+            false,
+            false,
+            &[PostMessage::new("payload")],
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::MissingCorrelationId(_)));
+    }
+
+    #[test]
+    fn validate_outbound_posts_allows_ack_messages_with_correlation_ids() {
+        let uri = Uri::parse("bmq://bmq.test.mem.priority/example").unwrap();
+        let message = PostMessage::new("payload").correlation_id(CorrelationId::new(7));
+        validate_outbound_posts(
+            &uri,
+            &QueueOptions::writer()
+                .flags(crate::types::QueueFlags::WRITE | crate::types::QueueFlags::ACK),
+            false,
+            false,
+            &[message],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn watermark_monitor_emits_high_and_normal_transitions() {
+        let (events, _) = broadcast::channel(16);
+        let monitor = EventWatermarkMonitor::new(1, 3, events.clone());
+        let mut rx = events.subscribe();
+
+        monitor.on_enqueue();
+        monitor.on_enqueue();
+        monitor.on_enqueue();
+        let event = rx.try_recv().unwrap();
+        match event {
+            SessionEvent::SlowConsumerHighWatermark { pending } => assert_eq!(pending, 3),
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        monitor.on_dequeue();
+        monitor.on_dequeue();
+        let event = rx.try_recv().unwrap();
+        match event {
+            SessionEvent::SlowConsumerNormal { pending } => assert_eq!(pending, 1),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
 }
