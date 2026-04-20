@@ -452,6 +452,11 @@ impl Default for QueueOptions {
 }
 
 impl QueueOptions {
+    const DEFAULT_MAX_UNCONFIRMED_MESSAGES: i64 = 1000;
+    const DEFAULT_MAX_UNCONFIRMED_BYTES: i64 = 33_554_432;
+    const DEFAULT_CONSUMER_PRIORITY: i32 = 0;
+    const DEFAULT_CONSUMER_PRIORITY_COUNT: i32 = 1;
+
     /// Returns default options for a reader queue.
     ///
     /// This enables the protocol `READ` and `ACK` flags and requests one read
@@ -589,7 +594,7 @@ impl QueueOptions {
     }
 
     pub(crate) fn suspended_queue_stream_parameters(&self) -> Option<QueueStreamParameters> {
-        if self.read_count <= 0 && !self.flags.contains(QueueFlags::READ) {
+        if !self.is_reader() {
             return None;
         }
 
@@ -603,32 +608,25 @@ impl QueueOptions {
     }
 
     pub(crate) fn default_queue_stream_parameters(&self) -> Option<QueueStreamParameters> {
-        if self.read_count <= 0
-            && self.max_unconfirmed_messages.is_none()
-            && self.max_unconfirmed_bytes.is_none()
-            && self.consumer_priority.is_none()
-            && self.consumer_priority_count.is_none()
-        {
+        if !self.is_reader() {
             return None;
         }
 
         Some(QueueStreamParameters {
             sub_id_info: None,
-            max_unconfirmed_messages: self.max_unconfirmed_messages.unwrap_or_default(),
-            max_unconfirmed_bytes: self.max_unconfirmed_bytes.unwrap_or_default(),
-            consumer_priority: self.consumer_priority.unwrap_or(i32::MIN),
-            consumer_priority_count: self.consumer_priority_count.unwrap_or_default(),
+            max_unconfirmed_messages: self
+                .max_unconfirmed_messages
+                .unwrap_or(Self::DEFAULT_MAX_UNCONFIRMED_MESSAGES),
+            max_unconfirmed_bytes: self
+                .max_unconfirmed_bytes
+                .unwrap_or(Self::DEFAULT_MAX_UNCONFIRMED_BYTES),
+            consumer_priority: self
+                .consumer_priority
+                .unwrap_or(Self::DEFAULT_CONSUMER_PRIORITY),
+            consumer_priority_count: self
+                .consumer_priority_count
+                .unwrap_or(Self::DEFAULT_CONSUMER_PRIORITY_COUNT),
         })
-    }
-
-    pub(crate) fn initial_queue_stream_parameters(&self) -> QueueStreamParameters {
-        QueueStreamParameters {
-            sub_id_info: None,
-            max_unconfirmed_messages: self.max_unconfirmed_messages.unwrap_or_default(),
-            max_unconfirmed_bytes: self.max_unconfirmed_bytes.unwrap_or_default(),
-            consumer_priority: self.consumer_priority.unwrap_or(i32::MIN),
-            consumer_priority_count: self.consumer_priority_count.unwrap_or_default(),
-        }
     }
 
     pub(crate) fn stream_parameters(&self) -> Option<StreamParameters> {
@@ -653,9 +651,13 @@ impl QueueOptions {
                 write_count: self.write_count,
                 admin_count: self.admin_count,
             },
-            configure_queue_stream: Some(self.initial_queue_stream_parameters()),
+            configure_queue_stream: self.default_queue_stream_parameters(),
             configure_stream: self.stream_parameters(),
         }
+    }
+
+    fn is_reader(&self) -> bool {
+        self.flags.contains(QueueFlags::READ) || self.read_count > 0
     }
 }
 
@@ -1280,12 +1282,18 @@ mod tests {
     }
 
     #[test]
-    fn writer_open_options_still_include_initial_queue_stream_config() {
+    fn writer_open_options_do_not_include_queue_stream_config() {
         let mapped = QueueOptions::writer().to_open_queue_options();
+        assert!(mapped.configure_queue_stream.is_none());
+    }
+
+    #[test]
+    fn reader_open_options_include_sdk_defaults() {
+        let mapped = QueueOptions::reader().to_open_queue_options();
         let stream = mapped.configure_queue_stream.unwrap();
-        assert_eq!(stream.max_unconfirmed_messages, 0);
-        assert_eq!(stream.max_unconfirmed_bytes, 0);
-        assert_eq!(stream.consumer_priority, i32::MIN);
-        assert_eq!(stream.consumer_priority_count, 0);
+        assert_eq!(stream.max_unconfirmed_messages, 1000);
+        assert_eq!(stream.max_unconfirmed_bytes, 33_554_432);
+        assert_eq!(stream.consumer_priority, 0);
+        assert_eq!(stream.consumer_priority_count, 1);
     }
 }

@@ -70,16 +70,16 @@ pub struct RecordedConfirm {
 }
 
 /// In-memory session mock with recorded side effects.
-#[derive(Clone)]
 pub struct MockSession {
     inner: Arc<MockSessionInner>,
+    event_cursor: Arc<Mutex<broadcast::Receiver<SessionEvent>>>,
 }
 
 /// In-memory queue mock returned by [`MockSession`].
-#[derive(Clone)]
 pub struct MockQueue {
     session: MockSession,
     state: Arc<MockQueueState>,
+    event_cursor: Arc<Mutex<broadcast::Receiver<QueueEvent>>>,
 }
 
 struct MockSessionInner {
@@ -103,10 +103,43 @@ struct MockQueueState {
     closed: AtomicBool,
 }
 
+impl Clone for MockSession {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            event_cursor: Arc::new(Mutex::new(self.inner.events.subscribe())),
+        }
+    }
+}
+
+impl Clone for MockQueue {
+    fn clone(&self) -> Self {
+        Self {
+            session: self.session.clone(),
+            state: self.state.clone(),
+            event_cursor: Arc::new(Mutex::new(self.state.events.subscribe())),
+        }
+    }
+}
+
+async fn recv_mock_event<T: Clone>(cursor: &Mutex<broadcast::Receiver<T>>) -> Result<T> {
+    loop {
+        let mut receiver = cursor.lock().await;
+        match receiver.recv().await {
+            Ok(event) => return Ok(event),
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                return Err(Error::RequestCanceled);
+            }
+        }
+    }
+}
+
 impl MockSession {
     /// Creates a started mock session.
     pub fn new() -> Self {
         let (events, _) = broadcast::channel(256);
+        let event_cursor = Arc::new(Mutex::new(events.subscribe()));
         Self {
             inner: Arc::new(MockSessionInner {
                 started: AtomicBool::new(true),
@@ -120,6 +153,7 @@ impl MockSession {
                 posts: Mutex::new(Vec::new()),
                 confirms: Mutex::new(Vec::new()),
             }),
+            event_cursor,
         }
     }
 
@@ -147,10 +181,7 @@ impl MockSession {
 
     /// Waits for the next session event.
     pub async fn next_event(&self) -> Result<SessionEvent> {
-        self.events()
-            .recv()
-            .await
-            .map_err(|_| Error::RequestCanceled)
+        recv_mock_event(&self.event_cursor).await
     }
 
     /// Injects a session event into subscribers.
@@ -173,6 +204,7 @@ impl MockSession {
         }
         let queue_id = self.inner.next_queue_id.fetch_add(1, Ordering::Relaxed);
         let (events, _) = broadcast::channel(256);
+        let event_cursor = Arc::new(Mutex::new(events.subscribe()));
         let state = Arc::new(MockQueueState {
             uri: uri.clone(),
             queue_id,
@@ -203,6 +235,7 @@ impl MockSession {
         Ok(MockQueue {
             session: self.clone(),
             state,
+            event_cursor,
         })
     }
 
@@ -217,9 +250,11 @@ impl MockSession {
             .get(uri.as_str())
             .copied()?;
         let state = self.inner.queues.lock().await.get(&queue_id).cloned()?;
+        let event_cursor = Arc::new(Mutex::new(state.events.subscribe()));
         Some(MockQueue {
             session: self.clone(),
             state,
+            event_cursor,
         })
     }
 
@@ -278,10 +313,7 @@ impl MockQueue {
 
     /// Waits for the next queue event.
     pub async fn next_event(&self) -> Result<QueueEvent> {
-        self.events()
-            .recv()
-            .await
-            .map_err(|_| Error::RequestCanceled)
+        recv_mock_event(&self.event_cursor).await
     }
 
     /// Injects a queue event into subscribers.

@@ -265,9 +265,18 @@ enum ConnectionState {
 ///
 /// Most applications should create one session per broker connection target,
 /// then open one or more [`Queue`] handles from it.
-#[derive(Clone)]
 pub struct Session {
     inner: Arc<SessionInner>,
+    event_cursor: Arc<Mutex<broadcast::Receiver<SessionEvent>>>,
+}
+
+impl Clone for Session {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            event_cursor: Arc::new(Mutex::new(self.inner.events.subscribe())),
+        }
+    }
 }
 
 /// Queue handle tied to a [`Session`].
@@ -281,10 +290,24 @@ pub struct Session {
 /// - confirm delivered messages
 /// - reconfigure flow-control or subscription settings
 /// - close the queue
-#[derive(Clone)]
 pub struct Queue {
     session: Session,
     state: Arc<QueueState>,
+    event_cursor: Arc<Mutex<broadcast::Receiver<QueueEvent>>>,
+    message_cursor: Arc<Mutex<broadcast::Receiver<QueueEvent>>>,
+    ack_cursor: Arc<Mutex<broadcast::Receiver<QueueEvent>>>,
+}
+
+impl Clone for Queue {
+    fn clone(&self) -> Self {
+        Self {
+            session: self.session.clone(),
+            state: self.state.clone(),
+            event_cursor: Arc::new(Mutex::new(self.state.events.subscribe())),
+            message_cursor: Arc::new(Mutex::new(self.state.events.subscribe())),
+            ack_cursor: Arc::new(Mutex::new(self.state.events.subscribe())),
+        }
+    }
 }
 
 /// Builder for batching post requests on a queue.
@@ -399,6 +422,40 @@ impl EventWatermarkMonitor {
     }
 }
 
+async fn recv_session_event(
+    cursor: &Mutex<broadcast::Receiver<SessionEvent>>,
+    request_timeout: Duration,
+) -> Result<SessionEvent> {
+    loop {
+        let mut receiver = cursor.lock().await;
+        match timeout(request_timeout, receiver.recv()).await {
+            Ok(Ok(event)) => return Ok(event),
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                return Err(Error::RequestCanceled);
+            }
+            Err(_) => return Err(Error::Timeout),
+        }
+    }
+}
+
+async fn recv_queue_event(
+    cursor: &Mutex<broadcast::Receiver<QueueEvent>>,
+    request_timeout: Duration,
+) -> Result<QueueEvent> {
+    loop {
+        let mut receiver = cursor.lock().await;
+        match timeout(request_timeout, receiver.recv()).await {
+            Ok(Ok(event)) => return Ok(event),
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                return Err(Error::RequestCanceled);
+            }
+            Err(_) => return Err(Error::Timeout),
+        }
+    }
+}
+
 impl Session {
     /// Alias for [`Session::connect`].
     ///
@@ -449,13 +506,17 @@ impl Session {
             message_dumping: Mutex::new(MessageDumpState::Off),
             watermark_monitor,
         });
+        let session = Self {
+            inner: inner.clone(),
+            event_cursor: Arc::new(Mutex::new(inner.events.subscribe())),
+        };
 
         let client = inner.establish_client().await?;
         inner.finish_connect(client, false).await?;
         inner.spawn_host_health_monitor();
         inner.spawn_stats_dumper();
 
-        Ok(Self { inner })
+        Ok(session)
     }
 
     /// Returns `true` when the session currently has an active transport.
@@ -514,11 +575,7 @@ impl Session {
     /// that prefer to "pull" session events one at a time instead of managing
     /// a spawned event task.
     pub async fn next_event(&self) -> Result<SessionEvent> {
-        let mut events = self.events();
-        timeout(self.inner.options.request_timeout, events.recv())
-            .await
-            .map_err(|_| Error::Timeout)?
-            .map_err(|_| Error::RequestCanceled)
+        recv_session_event(&self.event_cursor, self.inner.options.request_timeout).await
     }
 
     /// Sends an anonymous authentication request and emits `Authenticated`.
@@ -639,7 +696,6 @@ impl Session {
             event_tx,
             watermark_monitor: self.inner.watermark_monitor.clone(),
         });
-
         {
             let mut queues = self.inner.queues.lock().await;
             queues.insert(state.key, state.clone());
@@ -668,7 +724,10 @@ impl Session {
 
         let queue = Queue {
             session: self.clone(),
-            state,
+            state: state.clone(),
+            event_cursor: Arc::new(Mutex::new(state.events.subscribe())),
+            message_cursor: Arc::new(Mutex::new(state.events.subscribe())),
+            ack_cursor: Arc::new(Mutex::new(state.events.subscribe())),
         };
         Ok((
             queue,
@@ -703,6 +762,9 @@ impl Session {
         let state = self.inner.queues.lock().await.get(&queue_key).cloned()?;
         Some(Queue {
             session: self.clone(),
+            event_cursor: Arc::new(Mutex::new(state.events.subscribe())),
+            message_cursor: Arc::new(Mutex::new(state.events.subscribe())),
+            ack_cursor: Arc::new(Mutex::new(state.events.subscribe())),
             state,
         })
     }
@@ -715,6 +777,9 @@ impl Session {
         let state = self.inner.lookup_queue(queue_id).await?;
         Some(Queue {
             session: self.clone(),
+            event_cursor: Arc::new(Mutex::new(state.events.subscribe())),
+            message_cursor: Arc::new(Mutex::new(state.events.subscribe())),
+            ack_cursor: Arc::new(Mutex::new(state.events.subscribe())),
             state,
         })
     }
@@ -871,11 +936,11 @@ impl Queue {
     /// applications usually prefer [`Queue::events`] or
     /// [`Queue::spawn_event_handler`].
     pub async fn next_event(&self) -> Result<QueueEvent> {
-        let mut events = self.events();
-        timeout(self.session.inner.options.request_timeout, events.recv())
-            .await
-            .map_err(|_| Error::Timeout)?
-            .map_err(|_| Error::RequestCanceled)
+        recv_queue_event(
+            &self.event_cursor,
+            self.session.inner.options.request_timeout,
+        )
+        .await
     }
 
     /// Waits for the next pushed message on the queue.
@@ -883,12 +948,12 @@ impl Queue {
     /// Only `Message` queue events are returned; lifecycle events such as
     /// reopen, suspend, or resume are skipped internally.
     pub async fn next_message(&self) -> Result<ReceivedMessage> {
-        let mut events = self.events();
         loop {
-            let event = timeout(self.session.inner.options.request_timeout, events.recv())
-                .await
-                .map_err(|_| Error::Timeout)?
-                .map_err(|_| Error::RequestCanceled)?;
+            let event = recv_queue_event(
+                &self.message_cursor,
+                self.session.inner.options.request_timeout,
+            )
+            .await?;
             if let QueueEvent::Message(message) = event {
                 return Ok(message);
             }
@@ -901,12 +966,10 @@ impl Queue {
     /// Other queue event kinds are skipped internally until an acknowledgement
     /// arrives or the request timeout elapses.
     pub async fn next_ack(&self) -> Result<Acknowledgement> {
-        let mut events = self.events();
         loop {
-            let event = timeout(self.session.inner.options.request_timeout, events.recv())
-                .await
-                .map_err(|_| Error::Timeout)?
-                .map_err(|_| Error::RequestCanceled)?;
+            let event =
+                recv_queue_event(&self.ack_cursor, self.session.inner.options.request_timeout)
+                    .await?;
             if let QueueEvent::Ack(ack) = event {
                 return Ok(ack);
             }
@@ -2108,5 +2171,72 @@ mod tests {
             SessionEvent::SlowConsumerNormal { pending } => assert_eq!(pending, 1),
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn independent_queue_cursors_do_not_interfere() {
+        let (events, _) = broadcast::channel(16);
+        let message_cursor = Arc::new(Mutex::new(events.subscribe()));
+        let ack_cursor = Arc::new(Mutex::new(events.subscribe()));
+        let ack = Acknowledgement {
+            queue_id: 7,
+            status: 0,
+            correlation_id: CorrelationId::new(5),
+            message_guid: MessageGuid([2; 16]),
+        };
+        let message = ReceivedMessage {
+            queue_id: 7,
+            sub_queue_id: 0,
+            rda_info: crate::wire::RdaInfo::default(),
+            message_guid: MessageGuid([3; 16]),
+            payload: bytes::Bytes::from_static(b"hello"),
+            properties: crate::wire::MessageProperties::default(),
+            properties_are_old_style: false,
+            sub_queue_infos: Vec::new(),
+            message_group_id: None,
+            compression: crate::wire::CompressionAlgorithm::None,
+            flags: 0,
+            schema_wire_id: 0,
+        };
+
+        let message_task = tokio::spawn({
+            let cursor = message_cursor.clone();
+            async move {
+                loop {
+                    let event = recv_queue_event(&cursor, Duration::from_millis(200)).await?;
+                    if let QueueEvent::Message(message) = event {
+                        return Ok::<_, Error>(message);
+                    }
+                }
+            }
+        });
+        let ack_task = tokio::spawn({
+            let cursor = ack_cursor.clone();
+            async move {
+                loop {
+                    let event = recv_queue_event(&cursor, Duration::from_millis(200)).await?;
+                    if let QueueEvent::Ack(ack) = event {
+                        return Ok::<_, Error>(ack);
+                    }
+                }
+            }
+        });
+
+        let _ = events.send(QueueEvent::Ack(ack.clone()));
+        let _ = events.send(QueueEvent::Message(message.clone()));
+
+        let received_message = timeout(Duration::from_millis(200), message_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let received_ack = timeout(Duration::from_millis(200), ack_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(received_message, message);
+        assert_eq!(received_ack, ack);
     }
 }

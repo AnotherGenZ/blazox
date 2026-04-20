@@ -334,15 +334,29 @@ pub enum SessionEvent {
 /// A queue handle is a thin convenience wrapper around a queue id and the
 /// owning client.  It does not remember enough session state to restore itself
 /// after reconnect; that is the job of [`crate::session::Queue`].
-#[derive(Debug, Clone)]
 pub struct QueueHandle {
     client: Client,
+    push_cursor: Arc<Mutex<broadcast::Receiver<SessionEvent>>>,
+    ack_cursor: Arc<Mutex<broadcast::Receiver<SessionEvent>>>,
     /// Queue URI associated with the handle.
     pub uri: String,
     /// Queue id assigned by the client.
     pub queue_id: u32,
     /// Raw queue flags used when opening the handle.
     pub flags: u64,
+}
+
+impl Clone for QueueHandle {
+    fn clone(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            push_cursor: Arc::new(Mutex::new(self.client.subscribe())),
+            ack_cursor: Arc::new(Mutex::new(self.client.subscribe())),
+            uri: self.uri.clone(),
+            queue_id: self.queue_id,
+            flags: self.flags,
+        }
+    }
 }
 
 impl QueueHandle {
@@ -416,12 +430,9 @@ impl QueueHandle {
     /// This pulls from the parent client's transport event stream and skips
     /// unrelated queue ids until a matching push arrives.
     pub async fn next_push(&self) -> Result<PushMessage> {
-        let mut events = self.subscribe();
         loop {
-            let event = timeout(self.client.inner.request_timeout, events.recv())
-                .await
-                .map_err(|_| Error::Timeout)?
-                .map_err(|_| Error::RequestCanceled)?;
+            let event =
+                recv_transport_event(&self.push_cursor, self.client.inner.request_timeout).await?;
             if let SessionEvent::Push(messages) = event {
                 if let Some(message) = messages
                     .into_iter()
@@ -438,12 +449,9 @@ impl QueueHandle {
     /// This is most useful when the handle was opened with the ACK flag and the
     /// application wants to synchronously wait for producer acknowledgement.
     pub async fn next_ack(&self) -> Result<AckMessage> {
-        let mut events = self.subscribe();
         loop {
-            let event = timeout(self.client.inner.request_timeout, events.recv())
-                .await
-                .map_err(|_| Error::Timeout)?
-                .map_err(|_| Error::RequestCanceled)?;
+            let event =
+                recv_transport_event(&self.ack_cursor, self.client.inner.request_timeout).await?;
             if let SessionEvent::Ack(messages) = event {
                 if let Some(message) = messages
                     .into_iter()
@@ -471,9 +479,18 @@ impl QueueHandle {
 /// events.  It is intentionally close to the protocol described by Bloomberg's
 /// documentation and leaves higher-level concerns such as reconnect policy,
 /// queue restoration, and queue-local event routing to [`crate::session::Session`].
-#[derive(Debug, Clone)]
 pub struct Client {
     inner: Arc<Inner>,
+    event_cursor: Arc<Mutex<broadcast::Receiver<SessionEvent>>>,
+}
+
+impl Clone for Client {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            event_cursor: Arc::new(Mutex::new(self.inner.events.subscribe())),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -537,6 +554,7 @@ impl Client {
         let encoding = best_schema_encoding(&broker_response.broker_identity.features);
 
         let (events, _) = broadcast::channel(256);
+        let event_cursor = Arc::new(Mutex::new(events.subscribe()));
         let client = Self {
             inner: Arc::new(Inner {
                 writer: Mutex::new(writer),
@@ -557,6 +575,7 @@ impl Client {
                 encoding,
                 guid_generator: config.message_guid_generator(),
             }),
+            event_cursor,
         };
 
         tokio::spawn(read_loop(client.clone(), reader));
@@ -593,6 +612,15 @@ impl Client {
     /// transport read loop.
     pub fn subscribe(&self) -> broadcast::Receiver<SessionEvent> {
         self.inner.events.subscribe()
+    }
+
+    /// Waits for the next transport event on this client instance.
+    ///
+    /// Unlike repeatedly calling [`Client::subscribe`], this method advances a
+    /// persistent per-client cursor, so sequential calls do not miss already
+    /// buffered transport events.
+    pub async fn next_event(&self) -> Result<SessionEvent> {
+        recv_transport_event(&self.event_cursor, self.inner.request_timeout).await
     }
 
     /// Sends an explicit authentication request.
@@ -714,6 +742,8 @@ impl Client {
 
         Ok(QueueHandle {
             client: self.clone(),
+            push_cursor: Arc::new(Mutex::new(self.subscribe())),
+            ack_cursor: Arc::new(Mutex::new(self.subscribe())),
             uri,
             queue_id,
             flags: handle_parameters.flags,
@@ -960,6 +990,23 @@ impl Client {
                 | std::io::ErrorKind::ConnectionReset => Error::WriterClosed,
                 _ => Error::Io(error),
             })
+    }
+}
+
+async fn recv_transport_event(
+    cursor: &Mutex<broadcast::Receiver<SessionEvent>>,
+    request_timeout: Duration,
+) -> Result<SessionEvent> {
+    loop {
+        let mut receiver = cursor.lock().await;
+        match timeout(request_timeout, receiver.recv()).await {
+            Ok(Ok(event)) => return Ok(event),
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                return Err(Error::RequestCanceled);
+            }
+            Err(_) => return Err(Error::Timeout),
+        }
     }
 }
 
