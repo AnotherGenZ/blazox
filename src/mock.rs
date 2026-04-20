@@ -1,3 +1,5 @@
+//! In-memory mocks for session- and queue-level tests.
+
 use crate::error::{Error, Result};
 use crate::session::{
     Acknowledgement, CloseQueueStatus, ConfigureQueueStatus, QueueEvent, SessionEvent,
@@ -14,45 +16,66 @@ use std::sync::{
 };
 use tokio::sync::{Mutex, broadcast};
 
+/// Recorded queue open call.
 #[derive(Debug, Clone)]
 pub struct RecordedOpenQueue {
+    /// Queue URI.
     pub uri: Uri,
+    /// Options used for the open.
     pub options: QueueOptions,
+    /// Queue id assigned by the mock session.
     pub queue_id: u32,
 }
 
+/// Recorded queue reconfigure call.
 #[derive(Debug, Clone)]
 pub struct RecordedReconfigureQueue {
+    /// Queue URI.
     pub uri: Uri,
+    /// Options supplied during reconfiguration.
     pub options: QueueOptions,
+    /// Queue id affected by the reconfiguration.
     pub queue_id: u32,
 }
 
+/// Recorded queue close call.
 #[derive(Debug, Clone)]
 pub struct RecordedCloseQueue {
+    /// Queue URI.
     pub uri: Uri,
+    /// Queue id that was closed.
     pub queue_id: u32,
 }
 
+/// Recorded post call.
 #[derive(Debug, Clone)]
 pub struct RecordedPost {
+    /// Queue URI.
     pub uri: Uri,
+    /// Queue id targeted by the post.
     pub queue_id: u32,
+    /// Messages posted in the batch.
     pub messages: Vec<PostMessage>,
 }
 
+/// Recorded confirm call.
 #[derive(Debug, Clone)]
 pub struct RecordedConfirm {
+    /// Queue URI.
     pub uri: Uri,
+    /// Queue id targeted by the confirmations.
     pub queue_id: u32,
+    /// Confirmations sent in the batch.
     pub messages: Vec<ConfirmMessage>,
 }
 
+/// In-memory session mock with recorded side effects.
 #[derive(Clone)]
 pub struct MockSession {
     inner: Arc<MockSessionInner>,
 }
 
+/// In-memory queue mock returned by [`MockSession`].
 #[derive(Clone)]
 pub struct MockQueue {
     session: MockSession,
@@ -81,6 +104,7 @@ struct MockQueueState {
 }
 
 impl MockSession {
+    /// Creates a started mock session.
     pub fn new() -> Self {
         let (events, _) = broadcast::channel(256);
         Self {
@@ -99,24 +123,29 @@ impl MockSession {
         }
     }
 
+    /// Returns `true` when the mock session is started.
     pub fn is_started(&self) -> bool {
         self.inner.started.load(Ordering::SeqCst)
     }
 
+    /// Marks the mock session started and emits `Connected`.
     pub async fn start(&self) {
         self.inner.started.store(true, Ordering::SeqCst);
         let _ = self.inner.events.send(SessionEvent::Connected);
     }
 
+    /// Marks the mock session stopped and emits `Disconnected`.
     pub async fn stop(&self) {
         self.inner.started.store(false, Ordering::SeqCst);
         let _ = self.inner.events.send(SessionEvent::Disconnected);
     }
 
+    /// Subscribes to mock session events.
     pub fn events(&self) -> broadcast::Receiver<SessionEvent> {
         self.inner.events.subscribe()
     }
 
+    /// Waits for the next session event.
     pub async fn next_event(&self) -> Result<SessionEvent> {
         self.events()
             .recv()
@@ -124,10 +153,12 @@ impl MockSession {
             .map_err(|_| Error::RequestCanceled)
     }
 
+    /// Injects a session event into subscribers.
     pub async fn push_session_event(&self, event: SessionEvent) {
         let _ = self.inner.events.send(event);
     }
 
+    /// Opens or looks up a mock queue.
     pub async fn open_queue(
         &self,
         uri: impl AsRef<str>,
@@ -175,6 +206,7 @@ impl MockSession {
         })
     }
 
+    /// Looks up an open mock queue by URI.
     pub async fn get_queue(&self, uri: impl AsRef<str>) -> Option<MockQueue> {
         let uri = Uri::parse(uri.as_ref()).ok()?;
         let queue_id = self
@@ -191,26 +223,32 @@ impl MockSession {
         })
     }
 
+    /// Looks up an open mock queue id by URI.
     pub async fn get_queue_id(&self, uri: impl AsRef<str>) -> Option<u32> {
         self.get_queue(uri).await.map(|queue| queue.queue_id())
     }
 
+    /// Returns all recorded open calls.
     pub async fn recorded_opens(&self) -> Vec<RecordedOpenQueue> {
         self.inner.opens.lock().await.clone()
     }
 
+    /// Returns all recorded reconfigure calls.
     pub async fn recorded_reconfigures(&self) -> Vec<RecordedReconfigureQueue> {
         self.inner.reconfigures.lock().await.clone()
     }
 
+    /// Returns all recorded close calls.
     pub async fn recorded_closes(&self) -> Vec<RecordedCloseQueue> {
         self.inner.closes.lock().await.clone()
     }
 
+    /// Returns all recorded post calls.
     pub async fn recorded_posts(&self) -> Vec<RecordedPost> {
         self.inner.posts.lock().await.clone()
     }
 
+    /// Returns all recorded confirm calls.
     pub async fn recorded_confirms(&self) -> Vec<RecordedConfirm> {
         self.inner.confirms.lock().await.clone()
     }
@@ -223,18 +261,22 @@ impl Default for MockSession {
 }
 
 impl MockQueue {
+    /// Returns the queue URI.
     pub fn uri(&self) -> &Uri {
         &self.state.uri
     }
 
+    /// Returns the queue id.
     pub fn queue_id(&self) -> u32 {
         self.state.queue_id
     }
 
+    /// Subscribes to queue-local mock events.
     pub fn events(&self) -> broadcast::Receiver<QueueEvent> {
         self.state.events.subscribe()
     }
 
+    /// Waits for the next queue event.
     pub async fn next_event(&self) -> Result<QueueEvent> {
         self.events()
             .recv()
@@ -242,16 +284,19 @@ impl MockQueue {
             .map_err(|_| Error::RequestCanceled)
     }
 
+    /// Injects a queue event into subscribers.
     pub async fn push_event(&self, event: QueueEvent) {
         let _ = self.state.events.send(event);
     }
 
+    /// Records a single post call.
     pub async fn post(&self, message: PostMessage) -> Result<()> {
         let mut batch = PostBatch::new();
         batch.push(message);
         self.post_batch(batch).await
     }
 
+    /// Records a batched post call.
     pub async fn post_batch(&self, batch: PostBatch) -> Result<()> {
         if self.state.closed.load(Ordering::SeqCst) {
             return Err(Error::WriterClosed);
@@ -264,16 +309,19 @@ impl MockQueue {
         Ok(())
     }
 
+    /// Records a single confirmation.
     pub async fn confirm(&self, message_guid: MessageGuid, sub_queue_id: u32) -> Result<()> {
         let mut batch = ConfirmBatch::new();
         batch.push(message_guid, sub_queue_id);
         self.confirm_batch(batch).await
     }
 
+    /// Records a confirmation derived from a cookie.
     pub async fn confirm_cookie(&self, cookie: MessageConfirmationCookie) -> Result<()> {
         self.confirm(cookie.message_guid, cookie.sub_queue_id).await
     }
 
+    /// Records a batched confirm call.
     pub async fn confirm_batch(&self, batch: ConfirmBatch) -> Result<()> {
         if self.state.closed.load(Ordering::SeqCst) {
             return Err(Error::WriterClosed);
@@ -291,10 +339,12 @@ impl MockQueue {
         Ok(())
     }
 
+    /// Injects an acknowledgement event into queue subscribers.
     pub async fn acknowledge(&self, ack: Acknowledgement) {
         let _ = self.state.events.send(QueueEvent::Ack(ack));
     }
 
+    /// Records a queue reconfiguration and updates stored options.
     pub async fn reconfigure(&self, options: QueueOptions) -> Result<ConfigureQueueStatus> {
         *self.state.options.lock().await = options.clone();
         self.session
@@ -314,6 +364,7 @@ impl MockQueue {
         })
     }
 
+    /// Records a queue close and removes it from session lookups.
     pub async fn close(&self) -> Result<CloseQueueStatus> {
         self.state.closed.store(true, Ordering::SeqCst);
         self.session

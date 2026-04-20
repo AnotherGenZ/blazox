@@ -1,3 +1,20 @@
+//! Data-plane wire structures and codec helpers.
+//!
+//! This module models the part of the BlazingMQ protocol that is optimized for
+//! frequent traffic: binary event headers plus the `PUT`, `PUSH`, `ACK`, and
+//! `CONFIRM` message families.
+//!
+//! The important mental model is:
+//!
+//! - [`crate::schema`] is the control plane, used for infrequent structured
+//!   operations such as opening queues and authenticating.
+//! - [`wire`] is the data plane, used for message traffic that needs compact,
+//!   fast binary encoding.
+//!
+//! Most application code will never construct these headers directly, but the
+//! types are the source of truth for how the low-level [`crate::client::Client`]
+//! turns producer and consumer operations into bytes on the wire.
+
 use crate::ber::BerCodec;
 use crate::error::{Error, Result};
 use bytes::{BufMut, Bytes, BytesMut};
@@ -12,35 +29,56 @@ use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
+/// Word size used by the BlazingMQ binary protocol.
 pub const WORD_SIZE: usize = 4;
+/// Size of the fixed event header in bytes.
 pub const EVENT_HEADER_SIZE: usize = 8;
+/// Schema wire id used when no schema id is present.
 pub const INVALID_SCHEMA_WIRE_ID: i16 = 1;
 
 const MESSAGE_PROPERTIES_HEADER_SIZE: usize = 6;
 const MESSAGE_PROPERTY_HEADER_SIZE: usize = 6;
 
+/// BlazingMQ event types carried in the event header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum EventType {
+    /// Undefined event type.
     Undefined = 0,
+    /// Control-plane event.
     Control = 1,
+    /// Producer put event.
     Put = 2,
+    /// Consumer confirm event.
     Confirm = 3,
+    /// Broker push event.
     Push = 4,
+    /// Producer acknowledgement event.
     Ack = 5,
+    /// Cluster-state event.
     ClusterState = 6,
+    /// Elector event.
     Elector = 7,
+    /// Storage event.
     Storage = 8,
+    /// Recovery event.
     Recovery = 9,
+    /// Partition sync event.
     PartitionSync = 10,
+    /// Heartbeat request event.
     HeartbeatReq = 11,
+    /// Heartbeat response event.
     HeartbeatRsp = 12,
+    /// Reject event.
     Reject = 13,
+    /// Replication receipt event.
     ReplicationReceipt = 14,
+    /// Authentication event.
     Authentication = 15,
 }
 
 impl EventType {
+    /// Decodes an event type from its wire representation.
     pub fn from_u8(value: u8) -> Result<Self> {
         Ok(match value {
             0 => Self::Undefined,
@@ -68,14 +106,18 @@ impl EventType {
     }
 }
 
+/// Encoding used for schema events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum EncodingType {
+    /// BER encoding.
     Ber = 0,
+    /// JSON encoding.
     Json = 1,
 }
 
 impl EncodingType {
+    /// Decodes a schema encoding from its wire representation.
     pub fn from_u8(value: u8) -> Result<Self> {
         match value {
             0 => Ok(Self::Ber),
@@ -87,15 +129,20 @@ impl EncodingType {
     }
 }
 
+/// Compression algorithm used for message payloads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum CompressionAlgorithm {
+    /// No compression.
     None = 0,
+    /// Zlib compression.
     Zlib = 1,
+    /// Unknown or unsupported compression algorithm.
     Unknown = 255,
 }
 
 impl CompressionAlgorithm {
+    /// Decodes a compression algorithm from its wire representation.
     pub fn from_u8(value: u8) -> Self {
         match value {
             0 => Self::None,
@@ -105,10 +152,12 @@ impl CompressionAlgorithm {
     }
 }
 
+/// BlazingMQ message GUID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct MessageGuid(pub [u8; 16]);
 
 impl MessageGuid {
+    /// Creates a GUID from a 16-byte slice.
     pub fn from_slice(bytes: &[u8]) -> Result<Self> {
         if bytes.len() != 16 {
             return Err(Error::Protocol("message guid must be 16 bytes"));
@@ -118,11 +167,13 @@ impl MessageGuid {
         Ok(Self(guid))
     }
 
+    /// Returns the GUID bytes.
     pub fn as_bytes(self) -> [u8; 16] {
         self.0
     }
 }
 
+/// Locally generated message GUID source.
 #[derive(Debug)]
 pub struct MessageGuidGenerator {
     counter: AtomicU32,
@@ -131,6 +182,7 @@ pub struct MessageGuidGenerator {
 }
 
 impl MessageGuidGenerator {
+    /// Creates a generator using the supplied client identity components.
     pub fn new(
         client_id_hint: impl AsRef<str>,
         session_id: i32,
@@ -154,6 +206,7 @@ impl MessageGuidGenerator {
         }
     }
 
+    /// Returns the next message GUID.
     pub fn next(&self) -> MessageGuid {
         let counter = self.counter.fetch_add(1, Ordering::Relaxed) & 0x003f_ffff;
         let timer_tick = (self.timer_base.elapsed().as_nanos() as u64) & 0x00ff_ffff_ffff_ffff;
@@ -171,16 +224,23 @@ impl MessageGuidGenerator {
     }
 }
 
+/// Fixed header present at the start of every BlazingMQ event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EventHeader {
+    /// Total event length in bytes, including the header.
     pub length: u32,
+    /// Protocol version.
     pub protocol_version: u8,
+    /// Event type.
     pub event_type: EventType,
+    /// Header length expressed in protocol words.
     pub header_words: u8,
+    /// Type-specific header flags or schema encoding bits.
     pub type_specific: u8,
 }
 
 impl EventHeader {
+    /// Creates a header for the given event type.
     pub fn new(event_type: EventType) -> Self {
         let mut header = Self {
             length: EVENT_HEADER_SIZE as u32,
@@ -195,11 +255,13 @@ impl EventHeader {
         header
     }
 
+    /// Sets the schema encoding bits used by control/authentication events.
     pub fn set_control_encoding(&mut self, encoding: EncodingType) {
         self.type_specific &= !0b1110_0000;
         self.type_specific |= (encoding as u8) << 5;
     }
 
+    /// Returns the schema encoding carried by the header.
     pub fn schema_encoding(&self) -> Result<EncodingType> {
         if !matches!(
             self.event_type,
@@ -210,10 +272,12 @@ impl EventHeader {
         EncodingType::from_u8((self.type_specific & 0b1110_0000) >> 5)
     }
 
+    /// Alias for [`EventHeader::schema_encoding`].
     pub fn control_encoding(&self) -> Result<EncodingType> {
         self.schema_encoding()
     }
 
+    /// Encodes the header to its 8-byte wire form.
     pub fn encode(self) -> [u8; EVENT_HEADER_SIZE] {
         let mut out = [0_u8; EVENT_HEADER_SIZE];
         let length_word = self.length & 0x7fff_ffff;
@@ -225,6 +289,7 @@ impl EventHeader {
         out
     }
 
+    /// Decodes an event header from bytes.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < EVENT_HEADER_SIZE {
             return Err(Error::Protocol("event header is truncated"));
@@ -241,16 +306,25 @@ impl EventHeader {
     }
 }
 
+/// Wire-level message property value discriminator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum MessagePropertyType {
+    /// Undefined type.
     Undefined = 0,
+    /// Boolean value.
     Bool = 1,
+    /// Signed 8-bit integer.
     Byte = 2,
+    /// Signed 16-bit integer.
     Short = 3,
+    /// Signed 32-bit integer.
     Int32 = 4,
+    /// Signed 64-bit integer.
     Int64 = 5,
+    /// ASCII string.
     String = 6,
+    /// Opaque binary blob.
     Binary = 7,
 }
 
@@ -273,37 +347,52 @@ impl MessagePropertyType {
     }
 }
 
+/// Value stored in a message property.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MessagePropertyValue {
+    /// Boolean value.
     Bool(bool),
+    /// Signed 8-bit integer.
     Byte(i8),
+    /// Signed 16-bit integer.
     Short(i16),
+    /// Signed 32-bit integer.
     Int32(i32),
+    /// Signed 64-bit integer.
     Int64(i64),
+    /// ASCII string.
     String(String),
+    /// Opaque binary value.
     Binary(Bytes),
 }
 
+/// Single message property entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageProperty {
+    /// Property name.
     pub name: String,
+    /// Property value.
     pub value: MessagePropertyValue,
 }
 
+/// Collection of message properties.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MessageProperties {
     properties: Vec<MessageProperty>,
 }
 
 impl MessageProperties {
+    /// Creates an empty property collection.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Appends a fully constructed property.
     pub fn push(&mut self, property: MessageProperty) {
         self.properties.push(property);
     }
 
+    /// Appends a property by name and value.
     pub fn insert(&mut self, name: impl Into<String>, value: MessagePropertyValue) {
         self.push(MessageProperty {
             name: name.into(),
@@ -311,6 +400,7 @@ impl MessageProperties {
         });
     }
 
+    /// Returns the first property matching `name`.
     pub fn get(&self, name: &str) -> Option<&MessagePropertyValue> {
         self.properties
             .iter()
@@ -318,14 +408,17 @@ impl MessageProperties {
             .map(|property| &property.value)
     }
 
+    /// Returns an iterator over properties in insertion order.
     pub fn iter(&self) -> std::slice::Iter<'_, MessageProperty> {
         self.properties.iter()
     }
 
+    /// Returns the number of properties.
     pub fn len(&self) -> usize {
         self.properties.len()
     }
 
+    /// Returns `true` when no properties are present.
     pub fn is_empty(&self) -> bool {
         self.properties.is_empty()
     }
@@ -346,6 +439,7 @@ impl From<Vec<MessageProperty>> for MessageProperties {
     }
 }
 
+/// Validates and splits a complete event frame into header and payload.
 pub fn decode_frame(frame: &[u8]) -> Result<(EventHeader, &[u8])> {
     let header = EventHeader::decode(frame)?;
     if header.length as usize != frame.len() {
@@ -850,6 +944,7 @@ fn decode_application_data(
     }
 }
 
+/// Encodes a schema payload into a complete event frame.
 pub fn encode_schema_event<T: Serialize + BerCodec>(
     message: &T,
     event_type: EventType,
@@ -873,6 +968,7 @@ pub fn encode_schema_event<T: Serialize + BerCodec>(
     Ok(frame.freeze())
 }
 
+/// Encodes a control-plane payload into a complete control event frame.
 pub fn encode_control_event<T: Serialize + BerCodec>(
     message: &T,
     encoding: EncodingType,
@@ -880,6 +976,7 @@ pub fn encode_control_event<T: Serialize + BerCodec>(
     encode_schema_event(message, EventType::Control, encoding)
 }
 
+/// Decodes a control or authentication schema payload from an event frame.
 pub fn decode_control_event<T: DeserializeOwned + BerCodec>(
     header: &EventHeader,
     payload: &[u8],
@@ -898,24 +995,34 @@ pub fn decode_control_event<T: DeserializeOwned + BerCodec>(
     }
 }
 
+/// Encodes a heartbeat response event.
 pub fn encode_heartbeat_response() -> Bytes {
     let mut header = EventHeader::new(EventType::HeartbeatRsp);
     header.length = EVENT_HEADER_SIZE as u32;
     Bytes::copy_from_slice(&header.encode())
 }
 
+/// Flag bits carried by [`PutHeader::flags`].
 pub mod put_header_flags {
+    /// Broker should send an acknowledgement for the message.
     pub const ACK_REQUESTED: u8 = 1 << 0;
+    /// Application data contains encoded message properties.
     pub const MESSAGE_PROPERTIES: u8 = 1 << 1;
 }
 
+/// Flag bits carried by [`PushHeader::flags`].
 pub mod push_header_flags {
+    /// Message payload is implicit and omitted from the frame.
     pub const IMPLICIT_PAYLOAD: u8 = 1 << 0;
+    /// Application data contains encoded message properties.
     pub const MESSAGE_PROPERTIES: u8 = 1 << 1;
+    /// Broker marked the delivery out of order.
     pub const OUT_OF_ORDER: u8 = 1 << 2;
 }
 
+/// Re-export of [`push_header_flags`] using the protocol naming style.
 pub use push_header_flags as PushHeaderFlags;
+/// Re-export of [`put_header_flags`] using the protocol naming style.
 pub use put_header_flags as PutHeaderFlags;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -972,10 +1079,14 @@ impl OptionHeader {
     }
 }
 
+/// Redelivery-attempt metadata attached to a pushed message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RdaInfo {
+    /// Redelivery counter.
     pub counter: u8,
+    /// Whether the broker considers redelivery unlimited.
     pub is_unlimited: bool,
+    /// Whether the message has been marked poisonous.
     pub is_poisonous: bool,
 }
 
@@ -999,9 +1110,12 @@ impl RdaInfo {
     }
 }
 
+/// Sub-queue metadata attached to a pushed message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubQueueInfo {
+    /// Sub-queue identifier.
     pub sub_queue_id: u32,
+    /// Redelivery-attempt metadata.
     pub rda_info: RdaInfo,
 }
 
@@ -1014,23 +1128,35 @@ impl Default for SubQueueInfo {
     }
 }
 
+/// Per-message header inside a `PUT` event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PutHeader {
+    /// PUT flags such as acknowledgement requested or properties present.
     pub flags: u8,
+    /// Total message size in protocol words.
     pub message_words: u32,
+    /// Options area size in protocol words.
     pub options_words: u32,
+    /// Payload compression algorithm.
     pub compression: CompressionAlgorithm,
+    /// Header size in protocol words.
     pub header_words: u8,
+    /// Queue id targeted by the message.
     pub queue_id: u32,
+    /// Message GUID field used by the protocol.
     pub guid_or_correlation: MessageGuid,
+    /// CRC32C over the uncompressed payload.
     pub crc32c: u32,
+    /// Schema wire id attached to the payload.
     pub schema_wire_id: i16,
 }
 
 impl PutHeader {
+    /// Size of the encoded PUT header.
     pub const SIZE: usize = 36;
     const HEADER_WORDS: u8 = (Self::SIZE / WORD_SIZE) as u8;
 
+    /// Encodes the header into the provided buffer.
     pub fn encode(self, buf: &mut BytesMut) {
         let flags_and_words = (u32::from(self.flags) << 28) | (self.message_words & 0x0fff_ffff);
         let options_and_meta = ((self.options_words & 0x00ff_ffff) << 8)
@@ -1045,6 +1171,7 @@ impl PutHeader {
         buf.put_u16(0);
     }
 
+    /// Decodes a PUT header from bytes.
     pub fn decode(src: &[u8]) -> Result<Self> {
         if src.len() < Self::SIZE {
             return Err(Error::Protocol("put header is truncated"));
@@ -1065,16 +1192,24 @@ impl PutHeader {
     }
 }
 
+/// High-level description of a message to include in a `PUT` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboundPutFrame {
+    /// Queue id targeted by the message.
     pub queue_id: u32,
+    /// Application payload.
     pub payload: Bytes,
+    /// Message properties delivered alongside the payload.
     pub properties: MessageProperties,
+    /// Optional producer correlation id.
     pub correlation_id: Option<u32>,
+    /// Optional explicit message GUID.
     pub message_guid: Option<MessageGuid>,
+    /// Payload compression algorithm.
     pub compression: CompressionAlgorithm,
 }
 
+/// Encodes one or more outbound messages into a complete `PUT` event.
 pub fn encode_put_event(messages: &[OutboundPutFrame]) -> Result<Bytes> {
     if messages.is_empty() {
         return Err(Error::Protocol(
@@ -1128,21 +1263,32 @@ pub fn encode_put_event(messages: &[OutboundPutFrame]) -> Result<Bytes> {
     Ok(frame.freeze())
 }
 
+/// Per-message header inside a `PUSH` event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PushHeader {
+    /// PUSH flags such as implicit payload or properties present.
     pub flags: u8,
+    /// Total message size in protocol words.
     pub message_words: u32,
+    /// Options area size in protocol words.
     pub options_words: u32,
+    /// Payload compression algorithm.
     pub compression: CompressionAlgorithm,
+    /// Header size in protocol words.
     pub header_words: u8,
+    /// Queue id targeted by the message.
     pub queue_id: u32,
+    /// Message GUID assigned by the producer.
     pub message_guid: MessageGuid,
+    /// Schema wire id attached to the payload.
     pub schema_wire_id: i16,
 }
 
 impl PushHeader {
+    /// Size of a push header when a schema id field is present.
     pub const SIZE_WITH_SCHEMA_ID: usize = 32;
 
+    /// Decodes a PUSH header from bytes.
     pub fn decode(src: &[u8]) -> Result<Self> {
         if src.len() < 28 {
             return Err(Error::Protocol("push header is truncated"));
@@ -1172,13 +1318,20 @@ impl PushHeader {
     }
 }
 
+/// Fully decoded message from a `PUSH` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PushMessage {
+    /// Decoded push header.
     pub header: PushHeader,
+    /// Application payload.
     pub payload: Bytes,
+    /// Message properties delivered with the payload.
     pub properties: MessageProperties,
+    /// Whether the properties used the legacy encoded representation.
     pub properties_are_old_style: bool,
+    /// Sub-queue metadata carried in message options.
     pub sub_queue_infos: Vec<SubQueueInfo>,
+    /// Optional message group id carried in message options.
     pub message_group_id: Option<String>,
 }
 
@@ -1269,6 +1422,7 @@ fn decode_push_options(data: &[u8]) -> Result<DecodedPushOptions> {
     Ok(out)
 }
 
+/// Decodes a complete `PUSH` event payload.
 pub fn decode_push_event(payload: &[u8]) -> Result<Vec<PushMessage>> {
     let mut offset = 0;
     let mut out = Vec::new();
@@ -1315,16 +1469,22 @@ pub fn decode_push_event(payload: &[u8]) -> Result<Vec<PushMessage>> {
     Ok(out)
 }
 
+/// Header for an `ACK` event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AckHeader {
+    /// Header size in protocol words.
     pub header_words: u8,
+    /// Size of each acknowledgement message in protocol words.
     pub per_message_words: u8,
+    /// Event-level flags.
     pub flags: u8,
 }
 
 impl AckHeader {
+    /// Size of the encoded ACK header.
     pub const SIZE: usize = 4;
 
+    /// Decodes an ACK header from bytes.
     pub fn decode(src: &[u8]) -> Result<Self> {
         if src.len() < Self::SIZE {
             return Err(Error::Protocol("ack header is truncated"));
@@ -1338,17 +1498,24 @@ impl AckHeader {
     }
 }
 
+/// Single producer acknowledgement item.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AckMessage {
+    /// Broker status code.
     pub status: u8,
+    /// Producer correlation id.
     pub correlation_id: u32,
+    /// GUID assigned to the original message.
     pub message_guid: MessageGuid,
+    /// Queue id acknowledged by the broker.
     pub queue_id: u32,
 }
 
 impl AckMessage {
+    /// Size of the encoded ACK message.
     pub const SIZE: usize = 24;
 
+    /// Decodes an ACK message from bytes.
     pub fn decode(src: &[u8]) -> Result<Self> {
         if src.len() < Self::SIZE {
             return Err(Error::Protocol("ack message is truncated"));
@@ -1363,6 +1530,7 @@ impl AckMessage {
     }
 }
 
+/// Decodes a complete `ACK` event payload.
 pub fn decode_ack_event(payload: &[u8]) -> Result<Vec<AckMessage>> {
     let header = AckHeader::decode(payload)?;
     let header_bytes = usize::from(header.header_words) * WORD_SIZE;
@@ -1387,15 +1555,20 @@ pub fn decode_ack_event(payload: &[u8]) -> Result<Vec<AckMessage>> {
     Ok(out)
 }
 
+/// Header for a `CONFIRM` event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConfirmHeader {
+    /// Header size in protocol words.
     pub header_words: u8,
+    /// Size of each confirm message in protocol words.
     pub per_message_words: u8,
 }
 
 impl ConfirmHeader {
+    /// Size of the encoded confirm header.
     pub const SIZE: usize = 4;
 
+    /// Returns the standard client/broker confirm header.
     pub fn new() -> Self {
         Self {
             header_words: 1,
@@ -1403,6 +1576,7 @@ impl ConfirmHeader {
         }
     }
 
+    /// Decodes a confirm header from bytes.
     pub fn decode(src: &[u8]) -> Result<Self> {
         if src.len() < Self::SIZE {
             return Err(Error::Protocol("confirm header is truncated"));
@@ -1414,6 +1588,7 @@ impl ConfirmHeader {
         })
     }
 
+    /// Encodes the header into the provided buffer.
     pub fn encode(self, buf: &mut BytesMut) {
         buf.put_u8((self.header_words << 4) | (self.per_message_words & 0x0f));
         buf.put_u8(0);
@@ -1421,16 +1596,22 @@ impl ConfirmHeader {
     }
 }
 
+/// Single consumer confirm item.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfirmMessage {
+    /// Queue id being confirmed.
     pub queue_id: u32,
+    /// GUID of the delivered message.
     pub message_guid: MessageGuid,
+    /// Sub-queue id associated with the delivered message.
     pub sub_queue_id: u32,
 }
 
 impl ConfirmMessage {
+    /// Size of the encoded confirm message.
     pub const SIZE: usize = 24;
 
+    /// Encodes the message into the provided buffer.
     pub fn encode(self, buf: &mut BytesMut) {
         buf.put_u32(self.queue_id);
         buf.extend_from_slice(&self.message_guid.0);
@@ -1438,6 +1619,7 @@ impl ConfirmMessage {
     }
 }
 
+/// Encodes one or more confirmations into a complete `CONFIRM` event.
 pub fn encode_confirm_event(messages: &[ConfirmMessage]) -> Result<Bytes> {
     if messages.is_empty() {
         return Err(Error::Protocol(

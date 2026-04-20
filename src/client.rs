@@ -1,3 +1,23 @@
+//! Low-level asynchronous BlazingMQ transport client.
+//!
+//! This module exposes the transport and protocol layer described by the
+//! official
+//! [Client/Broker Protocol](https://bloomberg.github.io/blazingmq/docs/architecture/client_broker_protocol/)
+//! documentation.
+//!
+//! It is the right abstraction when you want to:
+//!
+//! - speak the BlazingMQ wire protocol without adopting the full reconnecting
+//!   session runtime
+//! - build your own queue registry or event loop
+//! - inspect raw `PUSH`, `ACK`, negotiation, authentication, or control
+//!   events
+//! - test protocol behavior directly
+//!
+//! It is *not* the most convenient API for day-to-day application code.  The
+//! [`crate::session`] module layers queue restoration, host health, tracing,
+//! and higher-level queue state management on top of this transport client.
+
 use crate::error::{Error, Result};
 use crate::schema::{
     AdminCommand, AuthenticationMessage, AuthenticationPayload, AuthenticationRequest,
@@ -26,45 +46,74 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{Mutex, broadcast, oneshot};
 use tokio::time::timeout;
 
+/// Raw queue flag helpers used by the protocol layer.
 pub mod queue_flags {
+    /// Administrative queue access.
     pub const ADMIN: u64 = 1 << 0;
+    /// Read queue access.
     pub const READ: u64 = 1 << 1;
+    /// Write queue access.
     pub const WRITE: u64 = 1 << 2;
+    /// Producer acknowledgement flag.
     pub const ACK: u64 = 1 << 3;
 
+    /// Adds the administrative bit to `flags`.
     pub const fn admin(flags: u64) -> u64 {
         flags | ADMIN
     }
 
+    /// Adds the read bit to `flags`.
     pub const fn read(flags: u64) -> u64 {
         flags | READ
     }
 
+    /// Adds the write bit to `flags`.
     pub const fn write(flags: u64) -> u64 {
         flags | WRITE
     }
 
+    /// Adds the acknowledgement bit to `flags`.
     pub const fn ack(flags: u64) -> u64 {
         flags | ACK
     }
 }
 
+/// Configuration for the low-level [`Client`].
+///
+/// These settings control the protocol handshake, request timeouts, write
+/// backpressure behavior, and the client identity advertised during
+/// negotiation.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
+    /// Timeout for generic request/response operations.
     pub request_timeout: Duration,
+    /// Timeout for queue open requests.
     pub open_queue_timeout: Duration,
+    /// Timeout for queue configure requests.
     pub configure_queue_timeout: Duration,
+    /// Timeout for queue close requests.
     pub close_queue_timeout: Duration,
+    /// Timeout for broker disconnect requests.
     pub disconnect_timeout: Duration,
+    /// Timeout for individual frame writes.
     pub channel_write_timeout: Duration,
+    /// Optional maximum frame size accepted by the write path.
     pub channel_high_watermark: Option<u64>,
+    /// Buffer size used while reading frames from the broker.
     pub blob_buffer_size: usize,
+    /// Client type advertised during negotiation.
     pub client_type: ClientType,
+    /// Process name advertised during negotiation.
     pub process_name: String,
+    /// Host name advertised during negotiation.
     pub host_name: String,
+    /// SDK version advertised during negotiation.
     pub sdk_version: i32,
+    /// Session id advertised during negotiation and used in GUID generation.
     pub session_id: i32,
+    /// Feature string advertised during negotiation.
     pub features: String,
+    /// User agent string advertised during negotiation.
     pub user_agent: String,
 }
 
@@ -144,11 +193,19 @@ impl ClientConfig {
     }
 }
 
+/// Queue-handle parameters for [`OpenQueueOptions`].
+///
+/// These values map directly to the `QueueHandleParameters` portion of the
+/// protocol's `OpenQueue` request.
 #[derive(Debug, Clone)]
 pub struct QueueHandleConfig {
+    /// Raw queue flag bits.
     pub flags: u64,
+    /// Requested reader handle count.
     pub read_count: i32,
+    /// Requested writer handle count.
     pub write_count: i32,
+    /// Requested administrative handle count.
     pub admin_count: i32,
 }
 
@@ -163,23 +220,42 @@ impl Default for QueueHandleConfig {
     }
 }
 
+/// Parameters used when opening a queue through the low-level client.
+///
+/// The protocol open workflow is two-step: first `OpenQueue`, then one or more
+/// configure requests.  This type lets callers describe that entire sequence
+/// up front.
 #[derive(Debug, Clone, Default)]
 pub struct OpenQueueOptions {
+    /// Queue-handle level parameters used by `OpenQueue`.
     pub handle: QueueHandleConfig,
+    /// Optional queue stream configuration sent after `OpenQueue`.
     pub configure_queue_stream: Option<QueueStreamParameters>,
+    /// Optional application/subscription configuration sent after `OpenQueue`.
     pub configure_stream: Option<StreamParameters>,
 }
 
+/// Producer message posted through the low-level client API.
+///
+/// This is the low-level counterpart to [`crate::types::PostMessage`].  The
+/// transport client accepts a raw `u32` correlation id because it operates in
+/// terms of the on-the-wire representation.
 #[derive(Debug, Clone)]
 pub struct OutboundPut {
+    /// Application payload.
     pub payload: Bytes,
+    /// Message properties delivered alongside the payload.
     pub properties: MessageProperties,
+    /// Optional producer correlation id echoed in acknowledgements.
     pub correlation_id: Option<u32>,
+    /// Optional explicit message GUID. When absent, one is generated.
     pub message_guid: Option<MessageGuid>,
+    /// Compression applied to the payload.
     pub compression: CompressionAlgorithm,
 }
 
 impl OutboundPut {
+    /// Creates a message with the provided payload.
     pub fn new(payload: impl Into<Bytes>) -> Self {
         Self {
             payload: payload.into(),
@@ -190,85 +266,144 @@ impl OutboundPut {
         }
     }
 
+    /// Replaces the message properties.
     pub fn with_properties(mut self, properties: MessageProperties) -> Self {
         self.properties = properties;
         self
     }
 
+    /// Sets the producer correlation id.
     pub fn with_correlation_id(mut self, correlation_id: u32) -> Self {
         self.correlation_id = Some(correlation_id);
         self
     }
 
+    /// Sets an explicit message GUID.
     pub fn with_message_guid(mut self, message_guid: MessageGuid) -> Self {
         self.message_guid = Some(message_guid);
         self
     }
 
+    /// Sets the payload compression algorithm.
     pub fn with_compression(mut self, compression: CompressionAlgorithm) -> Self {
         self.compression = compression;
         self
     }
 }
 
+/// Decoded schema event received from the broker.
+///
+/// These events belong to the control plane rather than the data plane.  They
+/// are useful for low-level tooling, diagnostics, and transport tests.
 #[derive(Debug, Clone)]
 pub enum InboundSchemaEvent {
+    /// Control message payload.
     Control(ControlMessage),
+    /// Negotiation message payload.
     Negotiation(NegotiationMessage),
+    /// Authentication message payload.
     Authentication(AuthenticationMessage),
+    /// JSON schema payload not currently modeled by this crate.
     UnknownJson(Value),
 }
 
+/// Transport events emitted by [`Client::subscribe`].
+///
+/// Unlike [`crate::session::SessionEvent`], these events are not routed to a
+/// particular queue registry and do not imply reconnect or host-health logic.
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
+    /// Schema event such as control, negotiation, or authentication.
     Schema(InboundSchemaEvent),
+    /// One or more acknowledgement messages.
     Ack(Vec<AckMessage>),
+    /// One or more pushed data messages.
     Push(Vec<PushMessage>),
+    /// Heartbeat request received from the broker.
     HeartbeatRequest,
+    /// Heartbeat response received from the broker.
     HeartbeatResponse,
+    /// Transport closed cleanly or hit EOF.
     TransportClosed,
+    /// Transport or decoding error.
     TransportError(String),
 }
 
+/// Low-level handle returned by [`Client::open_queue`].
+///
+/// A queue handle is a thin convenience wrapper around a queue id and the
+/// owning client.  It does not remember enough session state to restore itself
+/// after reconnect; that is the job of [`crate::session::Queue`].
 #[derive(Debug, Clone)]
 pub struct QueueHandle {
     client: Client,
+    /// Queue URI associated with the handle.
     pub uri: String,
+    /// Queue id assigned by the client.
     pub queue_id: u32,
+    /// Raw queue flags used when opening the handle.
     pub flags: u64,
 }
 
 impl QueueHandle {
+    /// Subscribes to transport-level events for the parent client.
+    ///
+    /// This lets low-level code consume raw `PUSH`, `ACK`, heartbeat, and
+    /// schema events and then decide for itself how to route or persist them.
     pub fn subscribe(&self) -> broadcast::Receiver<SessionEvent> {
         self.client.subscribe()
     }
 
+    /// Publishes a single message to the queue.
+    ///
+    /// The message is encoded into the binary `PUT` event format and written to
+    /// the broker immediately.
     pub async fn publish(&self, message: OutboundPut) -> Result<()> {
         self.client
             .publish_to_queue(self.queue_id, vec![message])
             .await
     }
 
+    /// Publishes multiple messages to the queue in one `PUT` event.
+    ///
+    /// This is more efficient than publishing each message separately because
+    /// the data-plane protocol is explicitly designed around batching.
     pub async fn publish_all(&self, messages: Vec<OutboundPut>) -> Result<()> {
         self.client.publish_to_queue(self.queue_id, messages).await
     }
 
+    /// Sends a `ConfigureQueueStream` request for this queue.
+    ///
+    /// Use this to update flow-control and consumer-priority settings after the
+    /// queue has already been opened.
     pub async fn configure_queue_stream(&self, params: QueueStreamParameters) -> Result<()> {
         self.client
             .configure_queue_stream(self.queue_id, params)
             .await
     }
 
+    /// Sends a `ConfigureStream` request for this queue.
+    ///
+    /// Use this to update application-id and subscription settings after the
+    /// queue has already been opened.
     pub async fn configure_stream(&self, params: StreamParameters) -> Result<()> {
         self.client.configure_stream(self.queue_id, params).await
     }
 
+    /// Sends a single consumer confirmation.
+    ///
+    /// This is the low-level counterpart to confirming a pushed message after
+    /// successful processing.
     pub async fn confirm(&self, message_guid: MessageGuid, sub_queue_id: u32) -> Result<()> {
         self.client
             .confirm(self.queue_id, message_guid, sub_queue_id)
             .await
     }
 
+    /// Sends multiple consumer confirmations.
+    ///
+    /// Batching confirmations is the natural fit for the binary `CONFIRM`
+    /// event layout.
     pub async fn confirm_all(
         &self,
         messages: impl IntoIterator<Item = (MessageGuid, u32)>,
@@ -276,6 +411,10 @@ impl QueueHandle {
         self.client.confirm_many(self.queue_id, messages).await
     }
 
+    /// Waits for the next pushed message targeting this queue.
+    ///
+    /// This pulls from the parent client's transport event stream and skips
+    /// unrelated queue ids until a matching push arrives.
     pub async fn next_push(&self) -> Result<PushMessage> {
         let mut events = self.subscribe();
         loop {
@@ -294,6 +433,10 @@ impl QueueHandle {
         }
     }
 
+    /// Waits for the next acknowledgement targeting this queue.
+    ///
+    /// This is most useful when the handle was opened with the ACK flag and the
+    /// application wants to synchronously wait for producer acknowledgement.
     pub async fn next_ack(&self) -> Result<AckMessage> {
         let mut events = self.subscribe();
         loop {
@@ -312,11 +455,22 @@ impl QueueHandle {
         }
     }
 
+    /// Closes the queue handle.
+    ///
+    /// Closing is the inverse of open: it sends the protocol close request for
+    /// this queue id and detaches the client from the queue.
     pub async fn close(&self, is_final: bool) -> Result<()> {
         self.client.close_queue(self, is_final).await
     }
 }
 
+/// Low-level asynchronous client that speaks the BlazingMQ protocol directly.
+///
+/// [`Client`] owns a single TCP transport, performs negotiation, sends
+/// request/response-style control messages, and exposes decoded transport
+/// events.  It is intentionally close to the protocol described by Bloomberg's
+/// documentation and leaves higher-level concerns such as reconnect policy,
+/// queue restoration, and queue-local event routing to [`crate::session::Session`].
 #[derive(Debug, Clone)]
 pub struct Client {
     inner: Arc<Inner>,
@@ -344,6 +498,12 @@ struct Inner {
 }
 
 impl Client {
+    /// Connects to the broker, performs negotiation, and starts the read loop.
+    ///
+    /// Negotiation is always the first control-plane exchange on a new TCP
+    /// connection.  The client advertises its identity and features, the broker
+    /// responds with its own identity and status, and the resulting feature set
+    /// determines whether later schema requests use JSON or BER.
     pub async fn connect(addr: impl AsRef<str>, config: ClientConfig) -> Result<Self> {
         let stream = TcpStream::connect(addr.as_ref()).await?;
         let (mut reader, mut writer) = stream.into_split();
@@ -403,22 +563,43 @@ impl Client {
         Ok(client)
     }
 
+    /// Returns the broker response captured during negotiation.
+    ///
+    /// This is useful when callers need to inspect broker-advertised
+    /// capabilities such as heartbeat settings or supported protocol features.
     pub fn broker_response(&self) -> &BrokerResponse {
         &self.inner.negotiated
     }
 
+    /// Returns the schema encoding chosen for subsequent requests.
+    ///
+    /// The choice is derived from the broker's feature string and determines
+    /// how control and authentication messages are encoded after negotiation.
     pub fn negotiated_encoding(&self) -> EncodingType {
         self.inner.encoding
     }
 
+    /// Returns the next locally generated message GUID.
+    ///
+    /// Producer code can use this to correlate external state with messages
+    /// before calling [`Client::publish_to_queue`].
     pub fn next_message_guid(&self) -> MessageGuid {
         self.inner.guid_generator.next()
     }
 
+    /// Subscribes to transport-level events.
+    ///
+    /// Each receiver sees the same decoded event stream emitted by the
+    /// transport read loop.
     pub fn subscribe(&self) -> broadcast::Receiver<SessionEvent> {
         self.inner.events.subscribe()
     }
 
+    /// Sends an explicit authentication request.
+    ///
+    /// Authentication is a separate schema event family from normal control
+    /// requests, so it is driven from the event stream rather than the
+    /// `rId`-based pending-request table.
     pub async fn authenticate(
         &self,
         request: AuthenticationRequest,
@@ -448,6 +629,10 @@ impl Client {
         }
     }
 
+    /// Sends an anonymous authentication request.
+    ///
+    /// This is a convenience wrapper around [`Client::authenticate`] for the
+    /// common broker setup that accepts `ANONYMOUS`.
     pub async fn authenticate_anonymous(&self) -> Result<AuthenticationResponse> {
         self.authenticate(AuthenticationRequest {
             mechanism: "ANONYMOUS".to_string(),
@@ -456,6 +641,11 @@ impl Client {
         .await
     }
 
+    /// Executes an administrative command.
+    ///
+    /// Administrative commands still travel over the normal control-plane
+    /// request/response mechanism, but their payload is opaque broker command
+    /// text instead of a structured queue operation.
     pub async fn admin_command(&self, command: impl Into<String>) -> Result<String> {
         let response = self
             .send_control_request(
@@ -474,6 +664,12 @@ impl Client {
         }
     }
 
+    /// Opens a queue and applies any follow-up configure requests.
+    ///
+    /// This implements the two-step workflow mandated by the BlazingMQ
+    /// protocol.  The `OpenQueue` request allocates the handle, after which
+    /// `ConfigureQueueStream` and `ConfigureStream` make the handle usable for
+    /// flow control, subscriptions, and application-level routing.
     pub async fn open_queue(
         &self,
         uri: impl Into<String>,
@@ -524,6 +720,11 @@ impl Client {
         })
     }
 
+    /// Closes a queue previously opened by this client.
+    ///
+    /// The caller is responsible for passing the same queue handle metadata
+    /// that was returned during open so the broker can identify the handle
+    /// being detached.
     pub async fn close_queue(&self, handle: &QueueHandle, is_final: bool) -> Result<()> {
         let response = self
             .send_control_request(
@@ -551,6 +752,13 @@ impl Client {
         }
     }
 
+    /// Sends a `ConfigureQueueStream` request for a queue id.
+    ///
+    /// This request controls consumer-flow parameters such as
+    /// `maxUnconfirmedMessages`, `maxUnconfirmedBytes`, and consumer priority,
+    /// as described by the official
+    /// [Consumer Flow Control](https://bloomberg.github.io/blazingmq/docs/features/consumer_flow_control/)
+    /// document.
     pub async fn configure_queue_stream(
         &self,
         queue_id: u32,
@@ -574,6 +782,12 @@ impl Client {
         }
     }
 
+    /// Sends a `ConfigureStream` request for a queue id.
+    ///
+    /// This request controls higher-level stream metadata such as application
+    /// id and subscriptions, as described by the official
+    /// [Subscriptions](https://bloomberg.github.io/blazingmq/docs/features/subscriptions/)
+    /// document.
     pub async fn configure_stream(&self, queue_id: u32, params: StreamParameters) -> Result<()> {
         let response = self
             .send_control_request(
@@ -593,6 +807,11 @@ impl Client {
         }
     }
 
+    /// Sends a `Disconnect` request to the broker.
+    ///
+    /// This is the graceful protocol shutdown path.  Closing the TCP socket
+    /// without sending `Disconnect` is still possible at the transport level,
+    /// but that is not what this method models.
     pub async fn disconnect(&self) -> Result<()> {
         let response = self
             .send_control_request(
@@ -609,6 +828,12 @@ impl Client {
         }
     }
 
+    /// Publishes one or more messages to a queue id.
+    ///
+    /// Correlation ids are registered locally before the frame is written so
+    /// that later `ACK` events can be enriched with the application's original
+    /// correlation id.  If the write fails, that temporary registration is
+    /// rolled back.
     pub async fn publish_to_queue(&self, queue_id: u32, messages: Vec<OutboundPut>) -> Result<()> {
         let mut correlation_ids = Vec::new();
         let wire_messages = messages
@@ -650,6 +875,10 @@ impl Client {
         Ok(())
     }
 
+    /// Sends a single consumer confirmation for a queue id.
+    ///
+    /// Use this after a pushed message has been processed successfully and the
+    /// broker may consider it consumed.
     pub async fn confirm(
         &self,
         queue_id: u32,
@@ -664,6 +893,10 @@ impl Client {
         self.write_frame(frame).await
     }
 
+    /// Sends multiple consumer confirmations for a queue id.
+    ///
+    /// Empty batches are treated as a no-op because the protocol requires at
+    /// least one confirmation message per event.
     pub async fn confirm_many(
         &self,
         queue_id: u32,
