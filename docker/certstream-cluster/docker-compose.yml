@@ -1,0 +1,80 @@
+x-broker-base: &broker-base
+  image: blazox-bmqbrkr:latest
+  build:
+    context: https://github.com/bloomberg/blazingmq.git#main
+    dockerfile: docker/Dockerfile
+  volumes:
+    - ./config:/etc/local/bmq:ro
+  restart: unless-stopped
+
+x-client-base: &client-base
+  image: blazox-coinbase-demo:latest
+  build:
+    context: ../..
+    dockerfile: docker/certstream-cluster/client.Dockerfile
+  depends_on:
+    - broker-a
+    - broker-b
+    - broker-c
+  restart: unless-stopped
+
+services:
+  broker-a:
+    <<: *broker-base
+    hostname: broker-a
+    command: /usr/local/bin/bmqbrkr -h broker-a -d DC1 /etc/local/bmq
+    ports:
+      - "31114:30114"
+
+  broker-b:
+    <<: *broker-base
+    hostname: broker-b
+    command: /usr/local/bin/bmqbrkr -h broker-b -d DC1 /etc/local/bmq
+    ports:
+      - "31115:30114"
+
+  broker-c:
+    <<: *broker-base
+    hostname: broker-c
+    command: /usr/local/bin/bmqbrkr -h broker-c -d DC2 /etc/local/bmq
+    ports:
+      - "31116:30114"
+
+  publisher:
+    <<: *client-base
+    environment:
+      BLAZOX_ROLE: publisher
+      BLAZOX_BROKER_ADDR: broker-a:30114
+      BLAZOX_DOMAIN: bmq.demo.persistent.priority
+      BLAZOX_FANOUT_DOMAIN: bmq.demo.persistent.fanout
+      BLAZOX_MARKET_DATA_URL: wss://ws-feed.exchange.coinbase.com
+      BLAZOX_PRODUCT_IDS: BTC-USD,ETH-USD,SOL-USD
+      BLAZOX_PUBLISH_EVERY_N: 10
+
+  worker-a:
+    <<: *client-base
+    environment:
+      BLAZOX_ROLE: worker
+      BLAZOX_BROKER_ADDR: broker-b:30114
+      BLAZOX_DOMAIN: bmq.demo.persistent.priority
+      BLAZOX_FANOUT_DOMAIN: bmq.demo.persistent.fanout
+      BLAZOX_FANOUT_APP_ID: foo
+      BLAZOX_WORKER_NAME: worker-a
+      BLAZOX_WORKER_DELAY_MS: 750
+      BLAZOX_FEATURE_DELAY_MS: 0
+      BLAZOX_PRIORITY_CONSUMER_PRIORITY: 10
+      BLAZOX_PRIORITY_RECONFIGURE_AFTER_MS: 20000
+      BLAZOX_PRIORITY_RECONFIGURE_TO: 0
+
+  worker-b:
+    <<: *client-base
+    environment:
+      BLAZOX_ROLE: worker
+      BLAZOX_BROKER_ADDR: broker-c:30114
+      BLAZOX_DOMAIN: bmq.demo.persistent.priority
+      BLAZOX_FANOUT_DOMAIN: bmq.demo.persistent.fanout
+      BLAZOX_FANOUT_APP_ID: bar
+      BLAZOX_WORKER_NAME: worker-b
+      BLAZOX_WORKER_DELAY_MS: 750
+      BLAZOX_FEATURE_DELAY_MS: 0
+      BLAZOX_PRIORITY_CONSUMER_PRIORITY: 5

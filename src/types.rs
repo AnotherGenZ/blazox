@@ -19,7 +19,9 @@
 use crate::client::{ClientConfig, OpenQueueOptions, QueueHandleConfig, queue_flags};
 use crate::error::{Error, Result};
 use crate::schema::AuthenticationRequest;
-use crate::schema::{QueueStreamParameters, StreamParameters, Subscription};
+use crate::schema::{
+    ConsumerInfo, QueueStreamParameters, StreamParameters, SubQueueIdInfo, Subscription,
+};
 use crate::wire::{CompressionAlgorithm, MessageGuid, MessageProperties};
 use bytes::Bytes;
 use std::fmt;
@@ -456,6 +458,7 @@ impl QueueOptions {
     const DEFAULT_MAX_UNCONFIRMED_BYTES: i64 = 33_554_432;
     const DEFAULT_CONSUMER_PRIORITY: i32 = 0;
     const DEFAULT_CONSUMER_PRIORITY_COUNT: i32 = 1;
+    const INITIAL_FANOUT_SUBQUEUE_ID: u32 = 1;
 
     /// Returns default options for a reader queue.
     ///
@@ -599,7 +602,7 @@ impl QueueOptions {
         }
 
         Some(QueueStreamParameters {
-            sub_id_info: None,
+            sub_id_info: self.sub_queue_id_info(),
             max_unconfirmed_messages: 0,
             max_unconfirmed_bytes: 0,
             consumer_priority: i32::MIN,
@@ -613,7 +616,7 @@ impl QueueOptions {
         }
 
         Some(QueueStreamParameters {
-            sub_id_info: None,
+            sub_id_info: self.sub_queue_id_info(),
             max_unconfirmed_messages: self
                 .max_unconfirmed_messages
                 .unwrap_or(Self::DEFAULT_MAX_UNCONFIRMED_MESSAGES),
@@ -630,22 +633,48 @@ impl QueueOptions {
     }
 
     pub(crate) fn stream_parameters(&self) -> Option<StreamParameters> {
-        if self.app_id.is_none() && self.subscriptions.is_empty() {
+        if self.subscriptions.is_empty() {
             return None;
         }
+
+        let default_consumer = ConsumerInfo {
+            max_unconfirmed_messages: self
+                .max_unconfirmed_messages
+                .unwrap_or(Self::DEFAULT_MAX_UNCONFIRMED_MESSAGES),
+            max_unconfirmed_bytes: self
+                .max_unconfirmed_bytes
+                .unwrap_or(Self::DEFAULT_MAX_UNCONFIRMED_BYTES),
+            consumer_priority: self
+                .consumer_priority
+                .unwrap_or(Self::DEFAULT_CONSUMER_PRIORITY),
+            consumer_priority_count: self
+                .consumer_priority_count
+                .unwrap_or(Self::DEFAULT_CONSUMER_PRIORITY_COUNT),
+        };
 
         Some(StreamParameters {
             app_id: self
                 .app_id
                 .clone()
                 .unwrap_or_else(|| "__default".to_string()),
-            subscriptions: self.subscriptions.clone(),
+            subscriptions: self
+                .subscriptions
+                .iter()
+                .cloned()
+                .map(|mut subscription| {
+                    if subscription.consumers.is_empty() {
+                        subscription.consumers.push(default_consumer.clone());
+                    }
+                    subscription
+                })
+                .collect(),
         })
     }
 
     pub(crate) fn to_open_queue_options(&self) -> OpenQueueOptions {
         OpenQueueOptions {
             handle: QueueHandleConfig {
+                sub_id_info: self.sub_queue_id_info(),
                 flags: self.flags.bits(),
                 read_count: self.read_count,
                 write_count: self.write_count,
@@ -658,6 +687,17 @@ impl QueueOptions {
 
     fn is_reader(&self) -> bool {
         self.flags.contains(QueueFlags::READ) || self.read_count > 0
+    }
+
+    fn sub_queue_id_info(&self) -> Option<SubQueueIdInfo> {
+        self.app_id.as_ref().map(|app_id| SubQueueIdInfo {
+            sub_id: if self.is_reader() {
+                Self::INITIAL_FANOUT_SUBQUEUE_ID
+            } else {
+                0
+            },
+            app_id: app_id.clone(),
+        })
     }
 }
 
@@ -1241,6 +1281,7 @@ impl ConfirmBatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Expression, ExpressionVersion};
 
     #[test]
     fn uri_parse_extracts_domain_and_queue() {
@@ -1276,15 +1317,59 @@ mod tests {
             16
         );
         assert_eq!(
-            mapped.configure_stream.as_ref().unwrap().app_id,
+            mapped.handle.sub_id_info.as_ref().unwrap().app_id,
             "consumer-a"
         );
+        assert_eq!(mapped.handle.sub_id_info.as_ref().unwrap().sub_id, 1);
+        assert_eq!(
+            mapped
+                .configure_queue_stream
+                .as_ref()
+                .unwrap()
+                .sub_id_info
+                .as_ref()
+                .unwrap()
+                .app_id,
+            "consumer-a"
+        );
+        assert_eq!(
+            mapped
+                .configure_queue_stream
+                .as_ref()
+                .unwrap()
+                .sub_id_info
+                .as_ref()
+                .unwrap()
+                .sub_id,
+            1
+        );
+        assert!(mapped.configure_stream.is_none());
     }
 
     #[test]
     fn writer_open_options_do_not_include_queue_stream_config() {
         let mapped = QueueOptions::writer().to_open_queue_options();
         assert!(mapped.configure_queue_stream.is_none());
+    }
+
+    #[test]
+    fn subscriptions_still_emit_configure_stream_for_app_id_consumers() {
+        let mapped = QueueOptions::reader()
+            .app_id("consumer-a")
+            .subscriptions(vec![Subscription {
+                s_id: 7,
+                expression: Expression {
+                    version: ExpressionVersion::Version1,
+                    text: "x == 1".to_string(),
+                },
+                consumers: Vec::new(),
+            }])
+            .to_open_queue_options();
+
+        let stream = mapped.configure_stream.expect("configure_stream");
+        assert_eq!(stream.app_id, "consumer-a");
+        assert_eq!(stream.subscriptions.len(), 1);
+        assert_eq!(stream.subscriptions[0].s_id, 7);
     }
 
     #[test]
@@ -1295,5 +1380,30 @@ mod tests {
         assert_eq!(stream.max_unconfirmed_bytes, 33_554_432);
         assert_eq!(stream.consumer_priority, 0);
         assert_eq!(stream.consumer_priority_count, 1);
+    }
+
+    #[test]
+    fn subscriptions_inherit_consumer_settings_when_missing_consumer_info() {
+        let mapped = QueueOptions::reader()
+            .max_unconfirmed_messages(16)
+            .max_unconfirmed_bytes(2048)
+            .consumer_priority(7)
+            .consumer_priority_count(3)
+            .subscriptions(vec![Subscription {
+                s_id: 42,
+                expression: Expression {
+                    version: ExpressionVersion::Version1,
+                    text: "x > 0".to_string(),
+                },
+                consumers: Vec::new(),
+            }])
+            .to_open_queue_options();
+
+        let subscription = &mapped.configure_stream.unwrap().subscriptions[0];
+        assert_eq!(subscription.consumers.len(), 1);
+        assert_eq!(subscription.consumers[0].max_unconfirmed_messages, 16);
+        assert_eq!(subscription.consumers[0].max_unconfirmed_bytes, 2048);
+        assert_eq!(subscription.consumers[0].consumer_priority, 7);
+        assert_eq!(subscription.consumers[0].consumer_priority_count, 3);
     }
 }

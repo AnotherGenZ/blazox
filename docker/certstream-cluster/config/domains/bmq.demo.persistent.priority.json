@@ -1,0 +1,37 @@
+{
+    "definition": {
+        "location": "demo",
+        "parameters": {
+            "maxDeliveryAttempts": 0,
+            "deduplicationTimeMs": 300000,
+            "consistency": {
+                "eventual": {}
+            },
+            "storage": {
+                "config": {
+                    "fileBacked": {}
+                },
+                "domainLimits": {
+                    "bytes": 16777216,
+                    "messages": 20000,
+                    "bytesWatermarkRatio": 0.8,
+                    "messagesWatermarkRatio": 0.8
+                },
+                "queueLimits": {
+                    "bytes": 4194304,
+                    "messages": 5000,
+                    "bytesWatermarkRatio": 0.8,
+                    "messagesWatermarkRatio": 0.8
+                }
+            },
+            "messageTtl": 300,
+            "maxProducers": 0,
+            "maxConsumers": 0,
+            "maxQueues": 0,
+            "maxIdleTime": 0,
+            "mode": {
+                "priority": {}
+            }
+        }
+    }
+}

@@ -24,7 +24,7 @@ use crate::schema::{
     AuthenticationResponse, BrokerResponse, ClientIdentity, ClientLanguage, ClientType, CloseQueue,
     ConfigureQueueStream, ConfigureStream, ControlMessage, ControlPayload, Empty, GuidInfo,
     NegotiationMessage, NegotiationPayload, OpenQueue, QueueHandleParameters,
-    QueueStreamParameters, StreamParameters,
+    QueueStreamParameters, StreamParameters, SubQueueIdInfo,
 };
 use crate::wire::{
     AckMessage, CompressionAlgorithm, EncodingType, EventHeader, EventType, MessageGuid,
@@ -199,6 +199,8 @@ impl ClientConfig {
 /// protocol's `OpenQueue` request.
 #[derive(Debug, Clone)]
 pub struct QueueHandleConfig {
+    /// Optional fanout sub-queue identification.
+    pub sub_id_info: Option<SubQueueIdInfo>,
     /// Raw queue flag bits.
     pub flags: u64,
     /// Requested reader handle count.
@@ -212,6 +214,7 @@ pub struct QueueHandleConfig {
 impl Default for QueueHandleConfig {
     fn default() -> Self {
         Self {
+            sub_id_info: None,
             flags: queue_flags::write(0),
             read_count: 0,
             write_count: 1,
@@ -344,6 +347,8 @@ pub struct QueueHandle {
     pub queue_id: u32,
     /// Raw queue flags used when opening the handle.
     pub flags: u64,
+    /// Optional fanout sub-queue identification used when opening the handle.
+    pub sub_id_info: Option<SubQueueIdInfo>,
 }
 
 impl Clone for QueueHandle {
@@ -355,6 +360,7 @@ impl Clone for QueueHandle {
             uri: self.uri.clone(),
             queue_id: self.queue_id,
             flags: self.flags,
+            sub_id_info: self.sub_id_info.clone(),
         }
     }
 }
@@ -708,7 +714,7 @@ impl Client {
         let handle_parameters = QueueHandleParameters {
             uri: uri.clone(),
             q_id: queue_id,
-            sub_id_info: None,
+            sub_id_info: options.handle.sub_id_info.clone(),
             flags: options.handle.flags,
             read_count: options.handle.read_count,
             write_count: options.handle.write_count,
@@ -747,6 +753,7 @@ impl Client {
             uri,
             queue_id,
             flags: handle_parameters.flags,
+            sub_id_info: handle_parameters.sub_id_info,
         })
     }
 
@@ -762,7 +769,7 @@ impl Client {
                     handle_parameters: QueueHandleParameters {
                         uri: handle.uri.clone(),
                         q_id: handle.queue_id,
-                        sub_id_info: None,
+                        sub_id_info: handle.sub_id_info.clone(),
                         flags: handle.flags,
                         read_count: i32::from((handle.flags & queue_flags::READ) != 0),
                         write_count: i32::from((handle.flags & queue_flags::WRITE) != 0),

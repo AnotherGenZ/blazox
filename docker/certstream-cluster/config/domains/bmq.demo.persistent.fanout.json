@@ -1,0 +1,58 @@
+{
+    "definition": {
+        "location": "demo",
+        "parameters": {
+            "maxDeliveryAttempts": 0,
+            "deduplicationTimeMs": 300000,
+            "consistency": {
+                "eventual": {}
+            },
+            "storage": {
+                "config": {
+                    "fileBacked": {}
+                },
+                "domainLimits": {
+                    "bytes": 16777216,
+                    "messages": 20000,
+                    "bytesWatermarkRatio": 0.8,
+                    "messagesWatermarkRatio": 0.8
+                },
+                "queueLimits": {
+                    "bytes": 4194304,
+                    "messages": 5000,
+                    "bytesWatermarkRatio": 0.8,
+                    "messagesWatermarkRatio": 0.8
+                }
+            },
+            "messageTtl": 300,
+            "maxProducers": 0,
+            "maxConsumers": 0,
+            "maxQueues": 0,
+            "maxIdleTime": 0,
+            "subscriptions": [
+                {
+                    "appId": "foo",
+                    "expression": {
+                        "version": "E_VERSION_1",
+                        "text": "fanout_route == 1 || fanout_route == 3"
+                    }
+                },
+                {
+                    "appId": "bar",
+                    "expression": {
+                        "version": "E_VERSION_1",
+                        "text": "fanout_route == 2 || fanout_route == 3"
+                    }
+                }
+            ],
+            "mode": {
+                "fanout": {
+                    "appIDs": [
+                        "foo",
+                        "bar"
+                    ]
+                }
+            }
+        }
+    }
+}

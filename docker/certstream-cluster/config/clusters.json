@@ -1,0 +1,110 @@
+{
+    "myClusters": [
+        {
+            "name": "demo",
+            "clusterAttributes": {
+                "isCSLModeEnabled": false,
+                "isFSMWorkflow": false
+            },
+            "nodes": [
+                {
+                    "id": 1,
+                    "dataCenter": "DC1",
+                    "name": "broker-a",
+                    "transport": {
+                        "tcp": {
+                            "endpoint": "tcp://broker-a:30114"
+                        }
+                    }
+                },
+                {
+                    "id": 2,
+                    "dataCenter": "DC1",
+                    "name": "broker-b",
+                    "transport": {
+                        "tcp": {
+                            "endpoint": "tcp://broker-b:30114"
+                        }
+                    }
+                },
+                {
+                    "id": 3,
+                    "dataCenter": "DC2",
+                    "name": "broker-c",
+                    "transport": {
+                        "tcp": {
+                            "endpoint": "tcp://broker-c:30114"
+                        }
+                    }
+                }
+            ],
+            "partitionConfig": {
+                "name": "local",
+                "flushAtShutdown": true,
+                "location": "/var/local/bmq/storage",
+                "maxArchivedFileSets": 0,
+                "maxDataFileSize": 268435456,
+                "maxJournalFileSize": 67108864,
+                "maxQlistFileSize": 8388608,
+                "maxCSLFileSize": 8388608,
+                "numPartitions": 1,
+                "preallocate": false,
+                "prefaultPages": false,
+                "archiveLocation": "/var/local/bmq/storage/archive",
+                "syncConfig": {
+                    "fileChunkSize": 4194304,
+                    "masterSyncMaxDurationMs": 600000,
+                    "maxAttemptsStorageSync": 3,
+                    "partitionSyncDataReqTimeoutMs": 120000,
+                    "partitionSyncEventSize": 4194304,
+                    "partitionSyncStateReqTimeoutMs": 120000,
+                    "startupRecoveryMaxDurationMs": 1200000,
+                    "startupWaitDurationMs": 0,
+                    "storageSyncReqTimeoutMs": 300000
+                }
+            },
+            "masterAssignment": "E_LEADER_IS_MASTER_ALL",
+            "elector": {
+                "electionResultTimeoutMs": 4000,
+                "heartbeatBroadcastPeriodMs": 2000,
+                "heartbeatCheckPeriodMs": 1000,
+                "heartbeatMissCount": 10,
+                "initialWaitTimeoutMs": 8000,
+                "leaderSyncDelayMs": 5000,
+                "maxRandomWaitTimeoutMs": 3000,
+                "quorum": 0
+            },
+            "queueOperations": {
+                "ackWindowSize": 500,
+                "assignmentTimeoutMs": 15000,
+                "closeTimeoutMs": 300000,
+                "configureTimeoutMs": 300000,
+                "consumptionMonitorPeriodMs": 30000,
+                "keepaliveDurationMs": 1800000,
+                "openTimeoutMs": 300000,
+                "reopenMaxAttempts": 10,
+                "reopenRetryIntervalMs": 5000,
+                "reopenTimeoutMs": 43200000,
+                "shutdownTimeoutMs": 20000,
+                "stopTimeoutMs": 10000
+            },
+            "clusterMonitorConfig": {
+                "maxTimeLeader": 60,
+                "maxTimeMaster": 120,
+                "maxTimeNode": 120,
+                "maxTimeFailover": 240,
+                "thresholdLeader": 30,
+                "thresholdMaster": 60,
+                "thresholdNode": 60,
+                "thresholdFailover": 120
+            },
+            "messageThrottleConfig": {
+                "lowThreshold": 2,
+                "highThreshold": 4,
+                "lowInterval": 1000,
+                "highInterval": 3000
+            }
+        }
+    ],
+    "proxyClusters": []
+}

@@ -663,8 +663,8 @@ impl Session {
     ///
     /// 1. send `OpenQueue`
     /// 2. send `ConfigureQueueStream`
-    /// 3. optionally send `ConfigureStream` when application id or
-    ///    subscriptions are configured
+    /// 3. optionally send `ConfigureStream` when consumer subscriptions are
+    ///    configured
     ///
     /// The resulting [`Queue`] is then registered with the session so that
     /// reconnect, host-health transitions, and inbound message routing can all
