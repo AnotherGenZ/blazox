@@ -1,6 +1,7 @@
 //! In-memory mocks for session- and queue-level tests.
 
 use crate::error::{Error, Result};
+use crate::event::{EventHub, EventReceiver, RecvError};
 use crate::session::{
     Acknowledgement, CloseQueueStatus, ConfigureQueueStatus, QueueEvent, SessionEvent,
 };
@@ -14,7 +15,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU32, Ordering},
 };
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::Mutex;
 
 /// Recorded queue open call.
 #[derive(Debug, Clone)]
@@ -72,20 +73,20 @@ pub struct RecordedConfirm {
 /// In-memory session mock with recorded side effects.
 pub struct MockSession {
     inner: Arc<MockSessionInner>,
-    event_cursor: Arc<Mutex<broadcast::Receiver<SessionEvent>>>,
+    event_cursor: Arc<Mutex<EventReceiver<SessionEvent>>>,
 }
 
 /// In-memory queue mock returned by [`MockSession`].
 pub struct MockQueue {
     session: MockSession,
     state: Arc<MockQueueState>,
-    event_cursor: Arc<Mutex<broadcast::Receiver<QueueEvent>>>,
+    event_cursor: Arc<Mutex<EventReceiver<QueueEvent>>>,
 }
 
 struct MockSessionInner {
     started: AtomicBool,
     next_queue_id: AtomicU32,
-    events: broadcast::Sender<SessionEvent>,
+    events: EventHub<SessionEvent>,
     queues: Mutex<HashMap<u32, Arc<MockQueueState>>>,
     queue_uris: Mutex<HashMap<String, u32>>,
     opens: Mutex<Vec<RecordedOpenQueue>>,
@@ -99,7 +100,7 @@ struct MockQueueState {
     uri: Uri,
     queue_id: u32,
     options: Mutex<QueueOptions>,
-    events: broadcast::Sender<QueueEvent>,
+    events: EventHub<QueueEvent>,
     closed: AtomicBool,
 }
 
@@ -122,23 +123,18 @@ impl Clone for MockQueue {
     }
 }
 
-async fn recv_mock_event<T: Clone>(cursor: &Mutex<broadcast::Receiver<T>>) -> Result<T> {
-    loop {
-        let mut receiver = cursor.lock().await;
-        match receiver.recv().await {
-            Ok(event) => return Ok(event),
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                return Err(Error::RequestCanceled);
-            }
-        }
+async fn recv_mock_event<T: Clone>(cursor: &Mutex<EventReceiver<T>>) -> Result<T> {
+    let mut receiver = cursor.lock().await;
+    match receiver.recv().await {
+        Ok(event) => Ok(event),
+        Err(RecvError::Closed) => Err(Error::RequestCanceled),
     }
 }
 
 impl MockSession {
     /// Creates a started mock session.
     pub fn new() -> Self {
-        let (events, _) = broadcast::channel(256);
+        let events = EventHub::new();
         let event_cursor = Arc::new(Mutex::new(events.subscribe()));
         Self {
             inner: Arc::new(MockSessionInner {
@@ -165,17 +161,17 @@ impl MockSession {
     /// Marks the mock session started and emits `Connected`.
     pub async fn start(&self) {
         self.inner.started.store(true, Ordering::SeqCst);
-        let _ = self.inner.events.send(SessionEvent::Connected);
+        self.inner.events.send(SessionEvent::Connected);
     }
 
     /// Marks the mock session stopped and emits `Disconnected`.
     pub async fn stop(&self) {
         self.inner.started.store(false, Ordering::SeqCst);
-        let _ = self.inner.events.send(SessionEvent::Disconnected);
+        self.inner.events.send(SessionEvent::Disconnected);
     }
 
     /// Subscribes to mock session events.
-    pub fn events(&self) -> broadcast::Receiver<SessionEvent> {
+    pub fn events(&self) -> EventReceiver<SessionEvent> {
         self.inner.events.subscribe()
     }
 
@@ -186,7 +182,7 @@ impl MockSession {
 
     /// Injects a session event into subscribers.
     pub async fn push_session_event(&self, event: SessionEvent) {
-        let _ = self.inner.events.send(event);
+        self.inner.events.send(event);
     }
 
     /// Opens or looks up a mock queue.
@@ -203,7 +199,7 @@ impl MockSession {
             return Ok(existing);
         }
         let queue_id = self.inner.next_queue_id.fetch_add(1, Ordering::Relaxed);
-        let (events, _) = broadcast::channel(256);
+        let events = EventHub::new();
         let event_cursor = Arc::new(Mutex::new(events.subscribe()));
         let state = Arc::new(MockQueueState {
             uri: uri.clone(),
@@ -227,11 +223,11 @@ impl MockSession {
             options,
             queue_id,
         });
-        let _ = self.inner.events.send(SessionEvent::QueueOpened {
+        self.inner.events.send(SessionEvent::QueueOpened {
             uri: uri.clone(),
             queue_id,
         });
-        let _ = state.events.send(QueueEvent::Opened { queue_id });
+        state.events.send(QueueEvent::Opened { queue_id });
         Ok(MockQueue {
             session: self.clone(),
             state,
@@ -307,7 +303,7 @@ impl MockQueue {
     }
 
     /// Subscribes to queue-local mock events.
-    pub fn events(&self) -> broadcast::Receiver<QueueEvent> {
+    pub fn events(&self) -> EventReceiver<QueueEvent> {
         self.state.events.subscribe()
     }
 
@@ -318,7 +314,7 @@ impl MockQueue {
 
     /// Injects a queue event into subscribers.
     pub async fn push_event(&self, event: QueueEvent) {
-        let _ = self.state.events.send(event);
+        self.state.events.send(event);
     }
 
     /// Records a single post call.
@@ -373,7 +369,7 @@ impl MockQueue {
 
     /// Injects an acknowledgement event into queue subscribers.
     pub async fn acknowledge(&self, ack: Acknowledgement) {
-        let _ = self.state.events.send(QueueEvent::Ack(ack));
+        self.state.events.send(QueueEvent::Ack(ack));
     }
 
     /// Records a queue reconfiguration and updates stored options.
@@ -420,8 +416,8 @@ impl MockQueue {
                 uri: self.state.uri.clone(),
                 queue_id: self.state.queue_id,
             });
-        let _ = self.state.events.send(QueueEvent::Closed);
-        let _ = self.session.inner.events.send(SessionEvent::QueueClosed {
+        self.state.events.send(QueueEvent::Closed);
+        self.session.inner.events.send(SessionEvent::QueueClosed {
             uri: self.state.uri.clone(),
         });
         Ok(CloseQueueStatus {

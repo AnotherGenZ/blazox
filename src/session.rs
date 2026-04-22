@@ -23,6 +23,7 @@ use crate::client::{
     Client, InboundSchemaEvent, OutboundPut, QueueHandle, SessionEvent as TransportEvent,
 };
 use crate::error::{Error, Result};
+use crate::event::{EventHub, EventReceiver, RecvError};
 use crate::schema::{AuthenticationRequest, AuthenticationResponse};
 use crate::types::{
     ConfirmBatch, ConfirmMessage, CorrelationId, DistributedTraceScope, HostHealthState,
@@ -37,7 +38,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::Duration;
-use tokio::sync::{Mutex, broadcast, mpsc, watch};
+use tokio::sync::{Mutex, mpsc, watch};
 use tokio::time::{sleep, timeout};
 use tracing::info;
 
@@ -267,7 +268,7 @@ enum ConnectionState {
 /// then open one or more [`Queue`] handles from it.
 pub struct Session {
     inner: Arc<SessionInner>,
-    event_cursor: Arc<Mutex<broadcast::Receiver<SessionEvent>>>,
+    event_cursor: Arc<Mutex<EventReceiver<SessionEvent>>>,
 }
 
 impl Clone for Session {
@@ -293,9 +294,9 @@ impl Clone for Session {
 pub struct Queue {
     session: Session,
     state: Arc<QueueState>,
-    event_cursor: Arc<Mutex<broadcast::Receiver<QueueEvent>>>,
-    message_cursor: Arc<Mutex<broadcast::Receiver<QueueEvent>>>,
-    ack_cursor: Arc<Mutex<broadcast::Receiver<QueueEvent>>>,
+    event_cursor: Arc<Mutex<EventReceiver<QueueEvent>>>,
+    message_cursor: Arc<Mutex<EventReceiver<QueueEvent>>>,
+    ack_cursor: Arc<Mutex<EventReceiver<QueueEvent>>>,
 }
 
 impl Clone for Queue {
@@ -344,7 +345,7 @@ struct SessionInner {
     reconnecting: AtomicBool,
     closed: AtomicBool,
     started: AtomicBool,
-    events: broadcast::Sender<SessionEvent>,
+    events: EventHub<SessionEvent>,
     event_tx: mpsc::UnboundedSender<SessionEvent>,
     connection: watch::Sender<ConnectionState>,
     watermark_monitor: Arc<EventWatermarkMonitor>,
@@ -359,7 +360,7 @@ struct QueueState {
     last_queue_id: AtomicU32,
     suspended: AtomicBool,
     closed: AtomicBool,
-    events: broadcast::Sender<QueueEvent>,
+    events: EventHub<QueueEvent>,
     event_tx: mpsc::UnboundedSender<QueueEvent>,
     watermark_monitor: Arc<EventWatermarkMonitor>,
 }
@@ -369,14 +370,14 @@ struct EventWatermarkMonitor {
     in_high_watermark: AtomicBool,
     low_watermark: usize,
     high_watermark: usize,
-    session_events: broadcast::Sender<SessionEvent>,
+    session_events: EventHub<SessionEvent>,
 }
 
 impl EventWatermarkMonitor {
     fn new(
         low_watermark: usize,
         high_watermark: usize,
-        session_events: broadcast::Sender<SessionEvent>,
+        session_events: EventHub<SessionEvent>,
     ) -> Self {
         Self {
             pending: AtomicUsize::new(0),
@@ -393,8 +394,7 @@ impl EventWatermarkMonitor {
             return;
         }
         if !self.in_high_watermark.swap(true, Ordering::SeqCst) {
-            let _ = self
-                .session_events
+            self.session_events
                 .send(SessionEvent::SlowConsumerHighWatermark { pending });
         }
     }
@@ -406,44 +406,33 @@ impl EventWatermarkMonitor {
             return;
         }
         if self.in_high_watermark.swap(false, Ordering::SeqCst) {
-            let _ = self
-                .session_events
+            self.session_events
                 .send(SessionEvent::SlowConsumerNormal { pending });
         }
     }
 }
 
 async fn recv_session_event(
-    cursor: &Mutex<broadcast::Receiver<SessionEvent>>,
+    cursor: &Mutex<EventReceiver<SessionEvent>>,
     request_timeout: Duration,
 ) -> Result<SessionEvent> {
-    loop {
-        let mut receiver = cursor.lock().await;
-        match timeout(request_timeout, receiver.recv()).await {
-            Ok(Ok(event)) => return Ok(event),
-            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
-            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
-                return Err(Error::RequestCanceled);
-            }
-            Err(_) => return Err(Error::Timeout),
-        }
+    let mut receiver = cursor.lock().await;
+    match timeout(request_timeout, receiver.recv()).await {
+        Ok(Ok(event)) => Ok(event),
+        Ok(Err(RecvError::Closed)) => Err(Error::RequestCanceled),
+        Err(_) => Err(Error::Timeout),
     }
 }
 
 async fn recv_queue_event(
-    cursor: &Mutex<broadcast::Receiver<QueueEvent>>,
+    cursor: &Mutex<EventReceiver<QueueEvent>>,
     request_timeout: Duration,
 ) -> Result<QueueEvent> {
-    loop {
-        let mut receiver = cursor.lock().await;
-        match timeout(request_timeout, receiver.recv()).await {
-            Ok(Ok(event)) => return Ok(event),
-            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
-            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
-                return Err(Error::RequestCanceled);
-            }
-            Err(_) => return Err(Error::Timeout),
-        }
+    let mut receiver = cursor.lock().await;
+    match timeout(request_timeout, receiver.recv()).await {
+        Ok(Ok(event)) => Ok(event),
+        Ok(Err(RecvError::Closed)) => Err(Error::RequestCanceled),
+        Err(_) => Err(Error::Timeout),
     }
 }
 
@@ -468,9 +457,8 @@ impl Session {
     /// transport bootstrap.  It creates the long-lived runtime needed for a
     /// client library that behaves like the official SDKs.
     pub async fn connect(options: SessionOptions) -> Result<Self> {
-        let event_capacity = options.event_queue_capacity();
         let guid_generator = options.to_client_config().message_guid_generator();
-        let (events, _) = broadcast::channel(event_capacity);
+        let events = EventHub::new();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let watermark_monitor = Arc::new(EventWatermarkMonitor::new(
             options.event_queue_low_watermark,
@@ -523,7 +511,7 @@ impl Session {
     /// schema events for the whole session.  Use this when application logic
     /// wants a central stream of operational state changes instead of
     /// per-queue handling.
-    pub fn events(&self) -> broadcast::Receiver<SessionEvent> {
+    pub fn events(&self) -> EventReceiver<SessionEvent> {
         self.inner.events.subscribe()
     }
 
@@ -542,8 +530,7 @@ impl Session {
             loop {
                 match events.recv().await {
                     Ok(event) => handler(event).await,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    Err(RecvError::Closed) => return,
                 }
             }
         })
@@ -666,7 +653,7 @@ impl Session {
     ) -> Result<(Queue, OpenQueueStatus)> {
         let uri = Uri::parse(uri.as_ref())?;
         let handle = self.inner.open_queue_with_retry(&uri, &options).await?;
-        let (events, _) = broadcast::channel(self.inner.options.event_queue_capacity());
+        let events = EventHub::new();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         spawn_queue_event_dispatcher(
             event_rx,
@@ -686,6 +673,17 @@ impl Session {
             event_tx,
             watermark_monitor: self.inner.watermark_monitor.clone(),
         });
+        let mut initially_suspended = false;
+        if self.inner.is_host_unhealthy() && state.should_suspend_on_bad_host_health().await {
+            state.suspended.store(true, Ordering::SeqCst);
+            if let Err(error) = self.inner.apply_suspended_queue_stream(&state).await {
+                state.suspended.store(false, Ordering::SeqCst);
+                let _ = handle.close(true).await;
+                return Err(error);
+            }
+            initially_suspended = true;
+        }
+
         {
             let mut queues = self.inner.queues.lock().await;
             queues.insert(state.key, state.clone());
@@ -700,10 +698,6 @@ impl Session {
             .await
             .insert(uri.to_string(), state.key);
 
-        if self.inner.is_host_unhealthy() && state.should_suspend_on_bad_host_health().await {
-            self.inner.suspend_queue_for_host_health(&state).await?;
-        }
-
         state.enqueue_event(QueueEvent::Opened {
             queue_id: handle.queue_id,
         });
@@ -711,6 +705,10 @@ impl Session {
             uri: uri.clone(),
             queue_id: handle.queue_id,
         });
+        if initially_suspended {
+            state.enqueue_event(QueueEvent::Suspended);
+            self.inner.emit_session(SessionEvent::QueueSuspended { uri: uri.clone() });
+        }
 
         let queue = Queue {
             session: self.clone(),
@@ -847,7 +845,10 @@ impl Session {
             self.inner.queue_ids.lock().await.clear();
             self.inner.queue_uris.lock().await.clear();
             for queue in queues {
+                queue.closed.store(true, Ordering::SeqCst);
                 queue.handle.lock().await.take();
+                queue.last_queue_id.store(0, Ordering::Relaxed);
+                queue.enqueue_event(QueueEvent::Closed);
             }
         }
 
@@ -886,7 +887,7 @@ impl Queue {
     ///
     /// Queue events are derived from session transport events after the session
     /// has already filtered them for the relevant queue id.
-    pub fn events(&self) -> broadcast::Receiver<QueueEvent> {
+    pub fn events(&self) -> EventReceiver<QueueEvent> {
         self.state.events.subscribe()
     }
 
@@ -904,8 +905,7 @@ impl Queue {
             loop {
                 match events.recv().await {
                     Ok(event) => handler(event).await,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    Err(RecvError::Closed) => return,
                 }
             }
         })
@@ -1051,7 +1051,7 @@ impl Queue {
     /// Prefer this over manually threading queue id, GUID, and sub-queue id
     /// around your application.
     pub async fn confirm_cookie(&self, cookie: MessageConfirmationCookie) -> Result<()> {
-        self.confirm(cookie.message_guid, cookie.sub_queue_id).await
+        self.session.confirm_message(cookie).await
     }
 
     /// Creates a builder for batched confirm requests.
@@ -1226,8 +1226,14 @@ impl SessionInner {
         let inner = self.clone();
         tokio::spawn(async move {
             let initial = *health.borrow_and_update();
+            if inner.closed.load(Ordering::SeqCst) {
+                return;
+            }
             inner.handle_host_health(initial).await;
             while health.changed().await.is_ok() {
+                if inner.closed.load(Ordering::SeqCst) {
+                    return;
+                }
                 let state = *health.borrow_and_update();
                 inner.handle_host_health(state).await;
             }
@@ -1260,6 +1266,9 @@ impl SessionInner {
         let unhealthy = matches!(state, HostHealthState::Unhealthy);
         let queues = self.queue_snapshot().await;
         for queue in queues {
+            if queue.closed.load(Ordering::SeqCst) {
+                continue;
+            }
             if !queue.should_suspend_on_bad_host_health().await {
                 continue;
             }
@@ -1410,6 +1419,7 @@ impl SessionInner {
         let queues = self.queue_snapshot().await;
         for queue in &queues {
             queue.handle.lock().await.take();
+            queue.last_queue_id.store(0, Ordering::Relaxed);
         }
         let _ = self.connection.send(ConnectionState::Reconnecting);
         self.reconnect_loop(reason).await;
@@ -1527,6 +1537,9 @@ impl SessionInner {
     ) -> Result<()> {
         if messages.is_empty() {
             return Ok(());
+        }
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(Error::WriterClosed);
         }
         let options = queue.options.lock().await.clone();
         validate_post_queue_state(&queue.uri, &options, queue.closed.load(Ordering::SeqCst))?;
@@ -1659,32 +1672,33 @@ impl SessionInner {
         queue.closed.store(true, Ordering::SeqCst);
         let handle = queue.handle.lock().await.clone();
         let options = queue.options.lock().await.clone();
-        if let Some(handle) = handle {
-            if let Ok(client) = self.wait_for_client().await {
-                if let Some(params) = options.suspended_queue_stream_parameters() {
-                    let _ = self
-                        .with_trace(
-                            TraceOperationKind::ConfigureQueue,
-                            Some(&queue.uri),
-                            client.configure_queue_stream(handle.queue_id, params),
-                        )
-                        .await;
-                }
-                if let Err(error) = self
+        if let Some(handle) = handle
+            && let Ok(client) = self.wait_for_client().await
+        {
+            if let Some(params) = options.suspended_queue_stream_parameters() {
+                let _ = self
                     .with_trace(
-                        TraceOperationKind::CloseQueue,
+                        TraceOperationKind::ConfigureQueue,
                         Some(&queue.uri),
-                        handle.close(true),
+                        client.configure_queue_stream(handle.queue_id, params),
                     )
-                    .await
-                {
-                    queue.closed.store(false, Ordering::SeqCst);
-                    return Err(error);
-                }
+                    .await;
+            }
+            if let Err(error) = self
+                .with_trace(
+                    TraceOperationKind::CloseQueue,
+                    Some(&queue.uri),
+                    handle.close(true),
+                )
+                .await
+            {
+                queue.closed.store(false, Ordering::SeqCst);
+                return Err(error);
             }
         }
 
         queue.handle.lock().await.take();
+        queue.last_queue_id.store(0, Ordering::Relaxed);
         self.queues.lock().await.remove(&queue.key);
         self.queue_uris.lock().await.remove(queue.uri.as_str());
         if let Some(queue_id) = queue.queue_id() {
@@ -1912,26 +1926,26 @@ fn validate_outbound_posts(
 
 fn spawn_session_event_dispatcher(
     mut rx: mpsc::UnboundedReceiver<SessionEvent>,
-    events: broadcast::Sender<SessionEvent>,
+    events: EventHub<SessionEvent>,
     monitor: Arc<EventWatermarkMonitor>,
 ) {
     tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
             monitor.on_dequeue();
-            let _ = events.send(event);
+            events.send(event);
         }
     });
 }
 
 fn spawn_queue_event_dispatcher(
     mut rx: mpsc::UnboundedReceiver<QueueEvent>,
-    events: broadcast::Sender<QueueEvent>,
+    events: EventHub<QueueEvent>,
     monitor: Arc<EventWatermarkMonitor>,
 ) {
     tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
             monitor.on_dequeue();
-            let _ = events.send(event);
+            events.send(event);
         }
     });
 }
@@ -1950,8 +1964,7 @@ async fn transport_loop(session: Arc<SessionInner>, client: Client) {
                     return;
                 }
             }
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+            Err(RecvError::Closed) => {
                 session.start_reconnect("transport receiver closed".to_string());
                 return;
             }
@@ -2070,7 +2083,7 @@ mod tests {
 
     #[test]
     fn watermark_monitor_emits_high_and_normal_transitions() {
-        let (events, _) = broadcast::channel(16);
+        let events = EventHub::new();
         let monitor = EventWatermarkMonitor::new(1, 3, events.clone());
         let mut rx = events.subscribe();
 
@@ -2094,7 +2107,7 @@ mod tests {
 
     #[tokio::test]
     async fn independent_queue_cursors_do_not_interfere() {
-        let (events, _) = broadcast::channel(16);
+        let events = EventHub::new();
         let message_cursor = Arc::new(Mutex::new(events.subscribe()));
         let ack_cursor = Arc::new(Mutex::new(events.subscribe()));
         let ack = Acknowledgement {
@@ -2141,8 +2154,8 @@ mod tests {
             }
         });
 
-        let _ = events.send(QueueEvent::Ack(ack.clone()));
-        let _ = events.send(QueueEvent::Message(message.clone()));
+        events.send(QueueEvent::Ack(ack.clone()));
+        events.send(QueueEvent::Message(message.clone()));
 
         let received_message = timeout(Duration::from_millis(200), message_task)
             .await
@@ -2157,5 +2170,109 @@ mod tests {
 
         assert_eq!(received_message, message);
         assert_eq!(received_ack, ack);
+    }
+
+    async fn test_session_with_queue(queue_id: u32) -> (Session, Queue, Arc<QueueState>) {
+        let events = EventHub::new();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let watermark_monitor = Arc::new(EventWatermarkMonitor::new(1, 8, events.clone()));
+        spawn_session_event_dispatcher(event_rx, events.clone(), watermark_monitor.clone());
+        let (connection, _) = watch::channel(ConnectionState::Connected);
+        let inner = Arc::new(SessionInner {
+            options: SessionOptions::default(),
+            client: Mutex::new(None),
+            guid_generator: SessionOptions::default().to_client_config().message_guid_generator(),
+            queues: Mutex::new(HashMap::new()),
+            queue_ids: Mutex::new(HashMap::new()),
+            queue_uris: Mutex::new(HashMap::new()),
+            next_queue_key: AtomicU64::new(2),
+            host_unhealthy: AtomicBool::new(false),
+            reconnecting: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+            started: AtomicBool::new(true),
+            events: events.clone(),
+            event_tx,
+            connection,
+            watermark_monitor: watermark_monitor.clone(),
+        });
+        let session = Session {
+            inner: inner.clone(),
+            event_cursor: Arc::new(Mutex::new(events.subscribe())),
+        };
+
+        let queue_events = EventHub::new();
+        let (queue_event_tx, queue_event_rx) = mpsc::unbounded_channel();
+        spawn_queue_event_dispatcher(queue_event_rx, queue_events.clone(), watermark_monitor);
+        let uri = Uri::parse("bmq://bmq.test.mem.priority/example").unwrap();
+        let state = Arc::new(QueueState {
+            key: 1,
+            uri: uri.clone(),
+            options: Mutex::new(QueueOptions::writer()),
+            handle: Mutex::new(None),
+            pending_posts: Mutex::new(VecDeque::new()),
+            last_queue_id: AtomicU32::new(queue_id),
+            suspended: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
+            events: queue_events.clone(),
+            event_tx: queue_event_tx,
+            watermark_monitor: inner.watermark_monitor.clone(),
+        });
+        inner.queues.lock().await.insert(state.key, state.clone());
+        inner.queue_ids.lock().await.insert(queue_id, state.key);
+        inner
+            .queue_uris
+            .lock()
+            .await
+            .insert(uri.to_string(), state.key);
+
+        let queue = Queue {
+            session: session.clone(),
+            state: state.clone(),
+            event_cursor: Arc::new(Mutex::new(queue_events.subscribe())),
+            message_cursor: Arc::new(Mutex::new(queue_events.subscribe())),
+            ack_cursor: Arc::new(Mutex::new(queue_events.subscribe())),
+        };
+        (session, queue, state)
+    }
+
+    #[tokio::test]
+    async fn posting_after_disconnect_returns_closed_error_without_buffering() {
+        let (session, queue, state) = test_session_with_queue(7).await;
+        session.disconnect().await.unwrap();
+
+        let err = queue.post(PostMessage::new("hello")).await.unwrap_err();
+        assert!(matches!(err, Error::QueueClosed(_) | Error::WriterClosed));
+        assert!(state.pending_posts.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn confirm_cookie_validates_cookie_queue_id() {
+        let (_session, queue, _state) = test_session_with_queue(7).await;
+        let err = queue
+            .confirm_cookie(MessageConfirmationCookie::new(8, MessageGuid([9; 16]), 0))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidConfiguration(_)));
+    }
+
+    #[test]
+    fn event_hub_delivers_backlog_without_lag_loss() {
+        let hub = EventHub::new();
+        let mut rx = hub.subscribe();
+        for value in 0..1024_u32 {
+            hub.send(value);
+        }
+
+        let mut received = Vec::new();
+        while let Ok(value) = rx.try_recv() {
+            received.push(value);
+        }
+        assert_eq!(received.len(), 1024);
+        assert_eq!(received.first().copied(), Some(0));
+        assert_eq!(received.last().copied(), Some(1023));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(crate::event::TryRecvError::Empty)
+        ));
     }
 }

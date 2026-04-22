@@ -2,7 +2,7 @@ mod support;
 
 use blazox::{
     AckMessage, Client, OpenQueueOptions, OutboundPut, PushMessage, QueueHandleConfig,
-    QueueStreamParameters, TransportEvent, queue_flags,
+    EventReceiver, QueueStreamParameters, TransportEvent, queue_flags,
 };
 use std::time::Duration;
 use support::{TestResult, blazox_timeout, disconnect_client, skip_unless_live};
@@ -185,7 +185,7 @@ fn consumer_open_options() -> OpenQueueOptions {
 
 async fn next_client_ack(
     duration: Duration,
-    events: &mut tokio::sync::broadcast::Receiver<TransportEvent>,
+    events: &mut EventReceiver<TransportEvent>,
     queue_id: u32,
 ) -> TestResult<AckMessage> {
     Ok(tokio::time::timeout(duration, async {
@@ -200,8 +200,7 @@ async fn next_client_ack(
                     }
                 }
                 Ok(_) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                Err(blazox::EventRecvError::Closed) => {
                     return Err(blazox::Error::RequestCanceled);
                 }
             }
@@ -212,7 +211,7 @@ async fn next_client_ack(
 
 async fn next_client_push(
     duration: Duration,
-    events: &mut tokio::sync::broadcast::Receiver<TransportEvent>,
+    events: &mut EventReceiver<TransportEvent>,
     queue_id: u32,
 ) -> TestResult<PushMessage> {
     Ok(tokio::time::timeout(duration, async {
@@ -227,8 +226,7 @@ async fn next_client_push(
                     }
                 }
                 Ok(_) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                Err(blazox::EventRecvError::Closed) => {
                     return Err(blazox::Error::RequestCanceled);
                 }
             }

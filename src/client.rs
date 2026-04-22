@@ -19,6 +19,7 @@
 //! and higher-level queue state management on top of this transport client.
 
 use crate::error::{Error, Result};
+use crate::event::{EventHub, EventReceiver, RecvError};
 use crate::schema::{
     AdminCommand, AuthenticationMessage, AuthenticationPayload, AuthenticationRequest,
     AuthenticationResponse, BrokerResponse, ClientIdentity, ClientLanguage, ClientType, CloseQueue,
@@ -43,7 +44,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::{Mutex, broadcast, oneshot};
+use tokio::sync::{Mutex, oneshot};
 use tokio::time::timeout;
 
 /// Raw queue flag helpers used by the protocol layer.
@@ -340,8 +341,8 @@ pub enum SessionEvent {
 /// after reconnect; that is the job of [`crate::session::Queue`].
 pub struct QueueHandle {
     client: Client,
-    push_cursor: Arc<Mutex<broadcast::Receiver<SessionEvent>>>,
-    ack_cursor: Arc<Mutex<broadcast::Receiver<SessionEvent>>>,
+    push_cursor: Arc<Mutex<EventReceiver<SessionEvent>>>,
+    ack_cursor: Arc<Mutex<EventReceiver<SessionEvent>>>,
     /// Queue URI associated with the handle.
     pub uri: String,
     /// Queue id assigned by the client.
@@ -371,7 +372,7 @@ impl QueueHandle {
     ///
     /// This lets low-level code consume raw `PUSH`, `ACK`, heartbeat, and
     /// schema events and then decide for itself how to route or persist them.
-    pub fn subscribe(&self) -> broadcast::Receiver<SessionEvent> {
+    pub fn subscribe(&self) -> EventReceiver<SessionEvent> {
         self.client.subscribe()
     }
 
@@ -486,7 +487,7 @@ impl QueueHandle {
 /// queue restoration, and queue-local event routing to [`crate::session::Session`].
 pub struct Client {
     inner: Arc<Inner>,
-    event_cursor: Arc<Mutex<broadcast::Receiver<SessionEvent>>>,
+    event_cursor: Arc<Mutex<EventReceiver<SessionEvent>>>,
 }
 
 impl Clone for Client {
@@ -503,7 +504,7 @@ struct Inner {
     writer: Mutex<OwnedWriteHalf>,
     pending_requests: Mutex<HashMap<i32, oneshot::Sender<ControlMessage>>>,
     pending_correlation_ids: Mutex<HashMap<MessageGuid, u32>>,
-    events: broadcast::Sender<SessionEvent>,
+    events: EventHub<SessionEvent>,
     next_request_id: AtomicI32,
     next_queue_id: AtomicU32,
     request_timeout: Duration,
@@ -558,7 +559,7 @@ impl Client {
         }
         let encoding = best_schema_encoding(&broker_response.broker_identity.features);
 
-        let (events, _) = broadcast::channel(256);
+        let events = EventHub::new();
         let event_cursor = Arc::new(Mutex::new(events.subscribe()));
         let client = Self {
             inner: Arc::new(Inner {
@@ -615,7 +616,7 @@ impl Client {
     ///
     /// Each receiver sees the same decoded event stream emitted by the
     /// transport read loop.
-    pub fn subscribe(&self) -> broadcast::Receiver<SessionEvent> {
+    pub fn subscribe(&self) -> EventReceiver<SessionEvent> {
         self.inner.events.subscribe()
     }
 
@@ -1000,20 +1001,19 @@ impl Client {
 }
 
 async fn recv_transport_event(
-    cursor: &Mutex<broadcast::Receiver<SessionEvent>>,
+    cursor: &Mutex<EventReceiver<SessionEvent>>,
     request_timeout: Duration,
 ) -> Result<SessionEvent> {
-    loop {
-        let mut receiver = cursor.lock().await;
-        match timeout(request_timeout, receiver.recv()).await {
-            Ok(Ok(event)) => return Ok(event),
-            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
-            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
-                return Err(Error::RequestCanceled);
-            }
-            Err(_) => return Err(Error::Timeout),
-        }
+    let mut receiver = cursor.lock().await;
+    match timeout(request_timeout, receiver.recv()).await {
+        Ok(Ok(event)) => Ok(event),
+        Ok(Err(RecvError::Closed)) => Err(Error::RequestCanceled),
+        Err(_) => Err(Error::Timeout),
     }
+}
+
+fn emit_transport_event(client: &Client, event: SessionEvent) {
+    client.inner.events.send(event);
 }
 
 fn best_schema_encoding(features: &str) -> EncodingType {
@@ -1056,14 +1056,11 @@ async fn read_loop(client: Client, mut reader: OwnedReadHalf) {
         let frame = match read_frame(&mut reader, client.inner.blob_buffer_size).await {
             Ok(frame) => frame,
             Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
-                let _ = client.inner.events.send(SessionEvent::TransportClosed);
+                emit_transport_event(&client, SessionEvent::TransportClosed);
                 break;
             }
             Err(error) => {
-                let _ = client
-                    .inner
-                    .events
-                    .send(SessionEvent::TransportError(error.to_string()));
+                emit_transport_event(&client, SessionEvent::TransportError(error.to_string()));
                 break;
             }
         };
@@ -1071,10 +1068,7 @@ async fn read_loop(client: Client, mut reader: OwnedReadHalf) {
         match handle_frame(&client, &frame).await {
             Ok(()) => {}
             Err(error) => {
-                let _ = client
-                    .inner
-                    .events
-                    .send(SessionEvent::TransportError(error.to_string()));
+                emit_transport_event(&client, SessionEvent::TransportError(error.to_string()));
             }
         }
     }
@@ -1094,44 +1088,38 @@ async fn handle_frame(client: &Client, frame: &[u8]) -> Result<()> {
                     }
                 }
             }
-            let _ = client.inner.events.send(SessionEvent::Ack(messages));
+            emit_transport_event(client, SessionEvent::Ack(messages));
             Ok(())
         }
         EventType::Push => {
-            let _ = client
-                .inner
-                .events
-                .send(SessionEvent::Push(decode_push_event(payload)?));
+            emit_transport_event(client, SessionEvent::Push(decode_push_event(payload)?));
             Ok(())
         }
         EventType::HeartbeatReq => {
             client.write_frame(encode_heartbeat_response()).await?;
-            let _ = client.inner.events.send(SessionEvent::HeartbeatRequest);
+            emit_transport_event(client, SessionEvent::HeartbeatRequest);
             Ok(())
         }
         EventType::HeartbeatRsp => {
-            let _ = client.inner.events.send(SessionEvent::HeartbeatResponse);
+            emit_transport_event(client, SessionEvent::HeartbeatResponse);
             Ok(())
         }
         EventType::Authentication => {
             let message = decode_control_event::<AuthenticationMessage>(&header, payload)?;
-            let _ =
-                client
-                    .inner
-                    .events
-                    .send(SessionEvent::Schema(InboundSchemaEvent::Authentication(
-                        message,
-                    )));
+            emit_transport_event(
+                client,
+                SessionEvent::Schema(InboundSchemaEvent::Authentication(message)),
+            );
             Ok(())
         }
         _ => {
-            let _ = client
-                .inner
-                .events
-                .send(SessionEvent::TransportError(format!(
+            emit_transport_event(
+                client,
+                SessionEvent::TransportError(format!(
                     "received unsupported event type {:?}",
                     header.event_type
-                )));
+                )),
+            );
             Ok(())
         }
     }
@@ -1150,30 +1138,26 @@ async fn handle_control_frame(client: &Client, header: EventHeader, payload: &[u
             let _ = sender.send(message);
             return Ok(());
         }
-        let _ = client
-            .inner
-            .events
-            .send(SessionEvent::Schema(InboundSchemaEvent::Control(message)));
+        emit_transport_event(
+            client,
+            SessionEvent::Schema(InboundSchemaEvent::Control(message)),
+        );
         return Ok(());
     }
 
     if let Ok(message) = decode_control_event::<NegotiationMessage>(&header, payload) {
-        let _ = client
-            .inner
-            .events
-            .send(SessionEvent::Schema(InboundSchemaEvent::Negotiation(
-                message,
-            )));
+        emit_transport_event(
+            client,
+            SessionEvent::Schema(InboundSchemaEvent::Negotiation(message)),
+        );
         return Ok(());
     }
 
     if let Ok(message) = decode_control_event::<AuthenticationMessage>(&header, payload) {
-        let _ = client
-            .inner
-            .events
-            .send(SessionEvent::Schema(InboundSchemaEvent::Authentication(
-                message,
-            )));
+        emit_transport_event(
+            client,
+            SessionEvent::Schema(InboundSchemaEvent::Authentication(message)),
+        );
         return Ok(());
     }
 
@@ -1188,10 +1172,10 @@ async fn handle_control_frame(client: &Client, header: EventHeader, payload: &[u
         .map(|idx| &payload[..=idx])
         .unwrap_or(payload);
     let value = serde_json::from_slice::<Value>(trimmed)?;
-    let _ = client
-        .inner
-        .events
-        .send(SessionEvent::Schema(InboundSchemaEvent::UnknownJson(value)));
+    emit_transport_event(
+        client,
+        SessionEvent::Schema(InboundSchemaEvent::UnknownJson(value)),
+    );
     Ok(())
 }
 

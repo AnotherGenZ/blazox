@@ -1126,9 +1126,6 @@ impl SessionOptions {
         config
     }
 
-    pub(crate) fn event_queue_capacity(&self) -> usize {
-        self.event_queue_high_watermark.max(1)
-    }
 }
 
 /// Message posted through a [`crate::session::Queue`].

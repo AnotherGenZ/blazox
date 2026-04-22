@@ -2,7 +2,7 @@ mod support;
 
 use blazox::{
     CompressionAlgorithm, CorrelationIdGenerator, ManualHostHealthMonitor, MessagePropertyValue,
-    PostMessage, QueueEvent, QueueOptions, Session,
+    EventReceiver, PostMessage, QueueEvent, QueueOptions, Session,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -877,14 +877,20 @@ async fn session_anonymous_authentication_round_trip() -> TestResult {
 }
 
 async fn next_queue_event(
-    events: &mut tokio::sync::broadcast::Receiver<QueueEvent>,
+    events: &mut EventReceiver<QueueEvent>,
 ) -> TestResult<QueueEvent> {
-    Ok(timeout(Duration::from_secs(2), events.recv()).await??)
+    match timeout(Duration::from_secs(2), events.recv()).await {
+        Ok(Ok(event)) => Ok(event),
+        Ok(Err(error)) => Err(Box::new(std::io::Error::other(format!(
+            "queue event stream closed: {error:?}"
+        )))),
+        Err(error) => Err(Box::new(error)),
+    }
 }
 
 async fn recv_payload_and_confirm(
     queue: &blazox::Queue,
-    events: &mut tokio::sync::broadcast::Receiver<QueueEvent>,
+    events: &mut EventReceiver<QueueEvent>,
     duration: Duration,
     label: &str,
 ) -> TestResult<String> {

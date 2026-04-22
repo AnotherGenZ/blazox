@@ -71,6 +71,7 @@
 #![warn(missing_docs)]
 
 mod ber;
+pub mod event;
 
 /// Low-level asynchronous client for direct protocol access.
 ///
@@ -112,6 +113,7 @@ pub use client::{
     QueueHandleConfig, SessionEvent as TransportEvent, queue_flags,
 };
 pub use error::{Error, Result};
+pub use event::{EventReceiver, RecvError as EventRecvError, TryRecvError as EventTryRecvError};
 pub use mock::{
     MockQueue, MockSession, RecordedCloseQueue, RecordedConfirm, RecordedOpenQueue, RecordedPost,
     RecordedReconfigureQueue,

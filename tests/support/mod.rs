@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use blazox::{
-    Acknowledgement, Client, ClientConfig, Error, Expression, ExpressionVersion,
+    Acknowledgement, Client, ClientConfig, Error, EventReceiver, Expression, ExpressionVersion,
     ManualHostHealthMonitor, MessageProperties, MessagePropertyValue, Queue, QueueEvent,
     QueueFlags, QueueOptions, ReceivedMessage, Session, SessionOptions, Subscription, Uri,
     UriBuilder,
@@ -180,7 +180,7 @@ pub async fn assert_no_message(queue: &Queue, window: Duration) -> TestResult {
 }
 
 pub async fn assert_no_message_on_events(
-    events: &mut tokio::sync::broadcast::Receiver<QueueEvent>,
+    events: &mut EventReceiver<QueueEvent>,
     window: Duration,
 ) -> TestResult {
     match timeout(window, next_queue_message(events)).await {
@@ -197,7 +197,7 @@ pub async fn assert_no_message_on_events(
 
 pub async fn recv_and_confirm_with_events(
     queue: &Queue,
-    events: &mut tokio::sync::broadcast::Receiver<QueueEvent>,
+    events: &mut EventReceiver<QueueEvent>,
     count: usize,
 ) -> TestResult<Vec<String>> {
     let mut payloads = Vec::with_capacity(count);
@@ -210,14 +210,13 @@ pub async fn recv_and_confirm_with_events(
 }
 
 pub async fn next_queue_message(
-    events: &mut tokio::sync::broadcast::Receiver<QueueEvent>,
+    events: &mut EventReceiver<QueueEvent>,
 ) -> Result<ReceivedMessage, Error> {
     loop {
         match events.recv().await {
             Ok(QueueEvent::Message(message)) => return Ok(message),
             Ok(_) => continue,
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+            Err(blazox::EventRecvError::Closed) => {
                 return Err(Error::RequestCanceled);
             }
         }
@@ -225,14 +224,13 @@ pub async fn next_queue_message(
 }
 
 pub async fn next_queue_ack(
-    events: &mut tokio::sync::broadcast::Receiver<QueueEvent>,
+    events: &mut EventReceiver<QueueEvent>,
 ) -> Result<Acknowledgement, Error> {
     loop {
         match events.recv().await {
             Ok(QueueEvent::Ack(ack)) => return Ok(ack),
             Ok(_) => continue,
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+            Err(blazox::EventRecvError::Closed) => {
                 return Err(Error::RequestCanceled);
             }
         }
