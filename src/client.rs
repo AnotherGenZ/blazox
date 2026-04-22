@@ -349,6 +349,12 @@ pub struct QueueHandle {
     pub queue_id: u32,
     /// Raw queue flags used when opening the handle.
     pub flags: u64,
+    /// Requested reader handle count used when opening the handle.
+    pub read_count: i32,
+    /// Requested writer handle count used when opening the handle.
+    pub write_count: i32,
+    /// Requested administrative handle count used when opening the handle.
+    pub admin_count: i32,
     /// Optional fanout sub-queue identification used when opening the handle.
     pub sub_id_info: Option<SubQueueIdInfo>,
 }
@@ -362,6 +368,9 @@ impl Clone for QueueHandle {
             uri: self.uri.clone(),
             queue_id: self.queue_id,
             flags: self.flags,
+            read_count: self.read_count,
+            write_count: self.write_count,
+            admin_count: self.admin_count,
             sub_id_info: self.sub_id_info.clone(),
         }
     }
@@ -753,6 +762,9 @@ impl Client {
             uri,
             queue_id,
             flags: handle_parameters.flags,
+            read_count: handle_parameters.read_count,
+            write_count: handle_parameters.write_count,
+            admin_count: handle_parameters.admin_count,
             sub_id_info: handle_parameters.sub_id_info,
         })
     }
@@ -771,9 +783,9 @@ impl Client {
                         q_id: handle.queue_id,
                         sub_id_info: handle.sub_id_info.clone(),
                         flags: handle.flags,
-                        read_count: i32::from((handle.flags & queue_flags::READ) != 0),
-                        write_count: i32::from((handle.flags & queue_flags::WRITE) != 0),
-                        admin_count: i32::from((handle.flags & queue_flags::ADMIN) != 0),
+                        read_count: handle.read_count,
+                        write_count: handle.write_count,
+                        admin_count: handle.admin_count,
                     },
                     is_final,
                 }),

@@ -23,7 +23,7 @@ use crate::client::{
     Client, InboundSchemaEvent, OutboundPut, QueueHandle, SessionEvent as TransportEvent,
 };
 use crate::error::{Error, Result};
-use crate::event::{EventHub, EventReceiver, RecvError};
+use crate::event::{EventHub, EventHubMetrics, EventReceiver, RecvError};
 use crate::schema::{AuthenticationRequest, AuthenticationResponse};
 use crate::types::{
     ConfirmBatch, ConfirmMessage, CorrelationId, DistributedTraceScope, HostHealthState,
@@ -356,13 +356,13 @@ struct QueueState {
     uri: Uri,
     options: Mutex<QueueOptions>,
     handle: Mutex<Option<QueueHandle>>,
-    pending_posts: Mutex<VecDeque<PostMessage>>,
+    pending_posts: Mutex<PendingPosts>,
     last_queue_id: AtomicU32,
     suspended: AtomicBool,
+    broker_suspended: AtomicBool,
     closed: AtomicBool,
     events: EventHub<QueueEvent>,
     event_tx: mpsc::UnboundedSender<QueueEvent>,
-    watermark_monitor: Arc<EventWatermarkMonitor>,
 }
 
 struct EventWatermarkMonitor {
@@ -410,6 +410,23 @@ impl EventWatermarkMonitor {
                 .send(SessionEvent::SlowConsumerNormal { pending });
         }
     }
+}
+
+impl EventHubMetrics for EventWatermarkMonitor {
+    fn on_buffered_event(&self) {
+        self.on_enqueue();
+    }
+
+    fn on_released_event(&self) {
+        self.on_dequeue();
+    }
+}
+
+#[derive(Debug, Default)]
+struct PendingPosts {
+    order: VecDeque<MessageGuid>,
+    messages: HashMap<MessageGuid, PostMessage>,
+    removed_since_compaction: usize,
 }
 
 async fn recv_session_event(
@@ -465,7 +482,8 @@ impl Session {
             options.event_queue_high_watermark,
             events.clone(),
         ));
-        spawn_session_event_dispatcher(event_rx, events.clone(), watermark_monitor.clone());
+        events.set_metrics(watermark_monitor.clone());
+        spawn_session_event_dispatcher(event_rx, events.clone());
         let (connection, _) = watch::channel(ConnectionState::Connecting);
         let inner = Arc::new(SessionInner {
             options,
@@ -654,30 +672,28 @@ impl Session {
         let uri = Uri::parse(uri.as_ref())?;
         let handle = self.inner.open_queue_with_retry(&uri, &options).await?;
         let events = EventHub::new();
+        events.set_metrics(self.inner.watermark_monitor.clone());
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        spawn_queue_event_dispatcher(
-            event_rx,
-            events.clone(),
-            self.inner.watermark_monitor.clone(),
-        );
+        spawn_queue_event_dispatcher(event_rx, events.clone());
         let state = Arc::new(QueueState {
             key: self.inner.next_queue_key.fetch_add(1, Ordering::Relaxed),
             uri: uri.clone(),
             options: Mutex::new(options),
             handle: Mutex::new(Some(handle.clone())),
-            pending_posts: Mutex::new(VecDeque::new()),
+            pending_posts: Mutex::new(PendingPosts::default()),
             last_queue_id: AtomicU32::new(handle.queue_id),
             suspended: AtomicBool::new(false),
+            broker_suspended: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             events,
             event_tx,
-            watermark_monitor: self.inner.watermark_monitor.clone(),
         });
         let mut initially_suspended = false;
         if self.inner.is_host_unhealthy() && state.should_suspend_on_bad_host_health().await {
             state.suspended.store(true, Ordering::SeqCst);
             if let Err(error) = self.inner.apply_suspended_queue_stream(&state).await {
                 state.suspended.store(false, Ordering::SeqCst);
+                state.set_broker_suspended(false);
                 let _ = handle.close(true).await;
                 return Err(error);
             }
@@ -848,6 +864,7 @@ impl Session {
                 queue.closed.store(true, Ordering::SeqCst);
                 queue.handle.lock().await.take();
                 queue.last_queue_id.store(0, Ordering::Relaxed);
+                queue.set_broker_suspended(false);
                 queue.enqueue_event(QueueEvent::Closed);
             }
         }
@@ -1277,8 +1294,13 @@ impl SessionInner {
             } else {
                 self.resume_queue_from_host_health(&queue).await
             };
-            if result.is_err() && unhealthy {
-                self.start_reconnect("host health suspension reconfiguration failed".to_string());
+            if result.is_err() {
+                let reason = if unhealthy {
+                    "host health suspension reconfiguration failed"
+                } else {
+                    "host health resume reconfiguration failed"
+                };
+                self.start_reconnect(reason.to_string());
             }
         }
     }
@@ -1420,6 +1442,7 @@ impl SessionInner {
         for queue in &queues {
             queue.handle.lock().await.take();
             queue.last_queue_id.store(0, Ordering::Relaxed);
+            queue.set_broker_suspended(false);
         }
         let _ = self.connection.send(ConnectionState::Reconnecting);
         self.reconnect_loop(reason).await;
@@ -1492,9 +1515,11 @@ impl SessionInner {
             });
 
             if !queue.suspended.load(Ordering::SeqCst) {
+                queue.set_broker_suspended(false);
                 self.flush_queue(&queue).await?;
             } else {
-                self.apply_suspended_queue_stream(&queue).await?;
+                self.apply_suspended_queue_stream_with_client(client, &queue)
+                    .await?;
             }
         }
         Ok(())
@@ -1617,7 +1642,7 @@ impl SessionInner {
 
         let pending_posts = {
             let pending = queue.pending_posts.lock().await;
-            pending.iter().cloned().collect::<Vec<_>>()
+            pending.iter_in_order().collect::<Vec<_>>()
         };
         if !pending_posts.is_empty() {
             let outbound = pending_posts
@@ -1699,6 +1724,7 @@ impl SessionInner {
 
         queue.handle.lock().await.take();
         queue.last_queue_id.store(0, Ordering::Relaxed);
+        queue.set_broker_suspended(false);
         self.queues.lock().await.remove(&queue.key);
         self.queue_uris.lock().await.remove(queue.uri.as_str());
         if let Some(queue_id) = queue.queue_id() {
@@ -1712,10 +1738,7 @@ impl SessionInner {
     }
 
     fn emit_session(&self, event: SessionEvent) {
-        self.watermark_monitor.on_enqueue();
-        if self.event_tx.send(event).is_err() {
-            self.watermark_monitor.on_dequeue();
-        }
+        let _ = self.event_tx.send(event);
     }
 
     async fn open_queue_with_retry(
@@ -1767,24 +1790,37 @@ impl SessionInner {
             )
             .await?;
         }
+        queue.set_broker_suspended(false);
         Ok(())
     }
 
     async fn apply_suspended_queue_stream(&self, queue: &Arc<QueueState>) -> Result<()> {
+        let client = self.wait_for_client().await?;
+        self.apply_suspended_queue_stream_with_client(&client, queue)
+            .await
+    }
+
+    async fn apply_suspended_queue_stream_with_client(
+        &self,
+        client: &Client,
+        queue: &Arc<QueueState>,
+    ) -> Result<()> {
         let Some(handle) = queue.handle.lock().await.clone() else {
             return Ok(());
         };
         let options = queue.options.lock().await.clone();
         let Some(params) = options.suspended_queue_stream_parameters() else {
+            queue.set_broker_suspended(false);
             return Ok(());
         };
-        let client = self.wait_for_client().await?;
         self.with_trace(
             TraceOperationKind::ConfigureQueue,
             Some(&queue.uri),
             client.configure_queue_stream(handle.queue_id, params),
         )
-        .await
+        .await?;
+        queue.set_broker_suspended(true);
+        Ok(())
     }
 
     async fn suspend_queue_for_host_health(
@@ -1794,7 +1830,11 @@ impl SessionInner {
         if !queue.set_suspended(true) {
             return Ok(());
         }
-        self.apply_suspended_queue_stream(queue).await?;
+        if let Err(error) = self.apply_suspended_queue_stream(queue).await {
+            queue.set_suspended(false);
+            queue.set_broker_suspended(false);
+            return Err(error);
+        }
         queue.enqueue_event(QueueEvent::Suspended);
         self.emit_session(SessionEvent::QueueSuspended {
             uri: queue.uri.clone(),
@@ -1806,11 +1846,15 @@ impl SessionInner {
         self: &Arc<Self>,
         queue: &Arc<QueueState>,
     ) -> Result<()> {
-        if !queue.set_suspended(false) {
+        if !queue.suspended.load(Ordering::SeqCst) {
             return Ok(());
         }
         let options = queue.options.lock().await.clone();
-        self.apply_queue_configuration(queue, &options).await?;
+        if queue.is_broker_suspended() {
+            self.apply_queue_configuration(queue, &options).await?;
+        }
+        queue.set_suspended(false);
+        queue.set_broker_suspended(false);
         queue.enqueue_event(QueueEvent::Resumed);
         self.emit_session(SessionEvent::QueueResumed {
             uri: queue.uri.clone(),
@@ -1847,6 +1891,14 @@ impl QueueState {
         self.options.lock().await.suspends_on_bad_host_health
     }
 
+    fn is_broker_suspended(&self) -> bool {
+        self.broker_suspended.load(Ordering::SeqCst)
+    }
+
+    fn set_broker_suspended(&self, suspended: bool) {
+        self.broker_suspended.store(suspended, Ordering::SeqCst);
+    }
+
     fn set_suspended(&self, suspended: bool) -> bool {
         self.suspended.swap(suspended, Ordering::SeqCst) != suspended
     }
@@ -1857,10 +1909,7 @@ impl QueueState {
     }
 
     fn enqueue_event(&self, event: QueueEvent) {
-        self.watermark_monitor.on_enqueue();
-        if self.event_tx.send(event).is_err() {
-            self.watermark_monitor.on_dequeue();
-        }
+        let _ = self.event_tx.send(event);
     }
 
     async fn buffer_pending_posts(&self, messages: &[PostMessage]) {
@@ -1869,24 +1918,46 @@ impl QueueState {
             let Some(message_guid) = message.message_guid else {
                 continue;
             };
-            if pending
-                .iter()
-                .any(|existing| existing.message_guid == Some(message_guid))
-            {
-                continue;
-            }
-            pending.push_back(message.clone());
+            pending.insert(message_guid, message.clone());
         }
     }
 
     async fn remove_pending_post(&self, message_guid: MessageGuid) {
         let mut pending = self.pending_posts.lock().await;
-        if let Some(index) = pending
-            .iter()
-            .position(|message| message.message_guid == Some(message_guid))
-        {
-            pending.remove(index);
+        pending.remove(&message_guid);
+    }
+}
+
+impl PendingPosts {
+    fn insert(&mut self, message_guid: MessageGuid, message: PostMessage) {
+        if self.messages.insert(message_guid, message).is_none() {
+            self.order.push_back(message_guid);
         }
+    }
+
+    fn remove(&mut self, message_guid: &MessageGuid) {
+        if self.messages.remove(message_guid).is_some() {
+            self.removed_since_compaction += 1;
+            self.compact_if_worthwhile();
+        }
+    }
+
+    fn iter_in_order(&self) -> impl Iterator<Item = PostMessage> + '_ {
+        self.order
+            .iter()
+            .filter_map(|guid| self.messages.get(guid).cloned())
+    }
+
+    fn len(&self) -> usize {
+        self.messages.len()
+    }
+
+    fn compact_if_worthwhile(&mut self) {
+        if self.removed_since_compaction <= self.messages.len().max(32) {
+            return;
+        }
+        self.order.retain(|guid| self.messages.contains_key(guid));
+        self.removed_since_compaction = 0;
     }
 }
 
@@ -1927,11 +1998,9 @@ fn validate_outbound_posts(
 fn spawn_session_event_dispatcher(
     mut rx: mpsc::UnboundedReceiver<SessionEvent>,
     events: EventHub<SessionEvent>,
-    monitor: Arc<EventWatermarkMonitor>,
 ) {
     tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
-            monitor.on_dequeue();
             events.send(event);
         }
     });
@@ -1940,11 +2009,9 @@ fn spawn_session_event_dispatcher(
 fn spawn_queue_event_dispatcher(
     mut rx: mpsc::UnboundedReceiver<QueueEvent>,
     events: EventHub<QueueEvent>,
-    monitor: Arc<EventWatermarkMonitor>,
 ) {
     tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
-            monitor.on_dequeue();
             events.send(event);
         }
     });
@@ -2176,7 +2243,8 @@ mod tests {
         let events = EventHub::new();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let watermark_monitor = Arc::new(EventWatermarkMonitor::new(1, 8, events.clone()));
-        spawn_session_event_dispatcher(event_rx, events.clone(), watermark_monitor.clone());
+        events.set_metrics(watermark_monitor.clone());
+        spawn_session_event_dispatcher(event_rx, events.clone());
         let (connection, _) = watch::channel(ConnectionState::Connected);
         let inner = Arc::new(SessionInner {
             options: SessionOptions::default(),
@@ -2202,20 +2270,21 @@ mod tests {
 
         let queue_events = EventHub::new();
         let (queue_event_tx, queue_event_rx) = mpsc::unbounded_channel();
-        spawn_queue_event_dispatcher(queue_event_rx, queue_events.clone(), watermark_monitor);
+        queue_events.set_metrics(watermark_monitor.clone());
+        spawn_queue_event_dispatcher(queue_event_rx, queue_events.clone());
         let uri = Uri::parse("bmq://bmq.test.mem.priority/example").unwrap();
         let state = Arc::new(QueueState {
             key: 1,
             uri: uri.clone(),
             options: Mutex::new(QueueOptions::writer()),
             handle: Mutex::new(None),
-            pending_posts: Mutex::new(VecDeque::new()),
+            pending_posts: Mutex::new(PendingPosts::default()),
             last_queue_id: AtomicU32::new(queue_id),
             suspended: AtomicBool::new(false),
+            broker_suspended: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             events: queue_events.clone(),
             event_tx: queue_event_tx,
-            watermark_monitor: inner.watermark_monitor.clone(),
         });
         inner.queues.lock().await.insert(state.key, state.clone());
         inner.queue_ids.lock().await.insert(queue_id, state.key);
@@ -2242,7 +2311,7 @@ mod tests {
 
         let err = queue.post(PostMessage::new("hello")).await.unwrap_err();
         assert!(matches!(err, Error::QueueClosed(_) | Error::WriterClosed));
-        assert!(state.pending_posts.lock().await.is_empty());
+        assert_eq!(state.pending_posts.lock().await.len(), 0);
     }
 
     #[tokio::test]
@@ -2274,5 +2343,26 @@ mod tests {
             rx.try_recv(),
             Err(crate::event::TryRecvError::Empty)
         ));
+    }
+
+    #[test]
+    fn pending_posts_preserve_order_while_deduplicating_and_removing() {
+        let guid1 = MessageGuid([1; 16]);
+        let guid2 = MessageGuid([2; 16]);
+        let guid3 = MessageGuid([3; 16]);
+
+        let mut pending = PendingPosts::default();
+        pending.insert(guid1, PostMessage::new("first").message_guid(guid1));
+        pending.insert(guid2, PostMessage::new("second").message_guid(guid2));
+        pending.insert(guid1, PostMessage::new("first-updated").message_guid(guid1));
+        pending.remove(&guid1);
+        pending.insert(guid3, PostMessage::new("third").message_guid(guid3));
+
+        let guids = pending
+            .iter_in_order()
+            .filter_map(|message| message.message_guid)
+            .collect::<Vec<_>>();
+        assert_eq!(guids, vec![guid2, guid3]);
+        assert_eq!(pending.len(), 2);
     }
 }
