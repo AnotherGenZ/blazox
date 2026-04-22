@@ -42,7 +42,7 @@ The publisher also opens its writer queues with producer acknowledgements enable
 From the repository root:
 
 ```bash
-docker compose -f docker/certstream-cluster/docker-compose.yml up --build
+docker compose -f docker/coinbase-market-data-cluster/docker-compose.yml up --build
 ```
 
 The first run takes time because Compose builds:
@@ -74,4 +74,4 @@ Useful environment variables are already set in the compose file:
 - `BLAZOX_PRIORITY_CONSUMER_PRIORITY` controls the dedicated `coinbase.priority` consumer tier for each worker.
 - `BLAZOX_PRIORITY_RECONFIGURE_AFTER_MS` and `BLAZOX_PRIORITY_RECONFIGURE_TO` let a worker change its consumer priority at runtime to demonstrate broker-side failover.
 
-You can change those values directly in [docker-compose.yml](/home/angz/Coding/blazox/docker/certstream-cluster/docker-compose.yml).
+You can change those values directly in [docker-compose.yml](/home/angz/Coding/blazox/docker/coinbase-market-data-cluster/docker-compose.yml).

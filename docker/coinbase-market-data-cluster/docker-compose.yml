@@ -11,7 +11,7 @@ x-client-base: &client-base
   image: blazox-coinbase-demo:latest
   build:
     context: ../..
-    dockerfile: docker/certstream-cluster/client.Dockerfile
+    dockerfile: docker/coinbase-market-data-cluster/client.Dockerfile
   depends_on:
     - broker-a
     - broker-b
