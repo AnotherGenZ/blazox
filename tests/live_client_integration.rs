@@ -158,6 +158,7 @@ fn default_queue_stream_parameters() -> QueueStreamParameters {
 fn producer_open_options() -> OpenQueueOptions {
     OpenQueueOptions {
         handle: QueueHandleConfig {
+            sub_id_info: None,
             flags: queue_flags::ack(queue_flags::write(0)),
             read_count: 0,
             write_count: 1,
@@ -171,6 +172,7 @@ fn producer_open_options() -> OpenQueueOptions {
 fn consumer_open_options() -> OpenQueueOptions {
     OpenQueueOptions {
         handle: QueueHandleConfig {
+            sub_id_info: None,
             flags: queue_flags::ack(queue_flags::read(0)),
             read_count: 1,
             write_count: 0,

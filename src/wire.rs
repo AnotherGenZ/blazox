@@ -1111,21 +1111,12 @@ impl RdaInfo {
 }
 
 /// Sub-queue metadata attached to a pushed message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SubQueueInfo {
     /// Sub-queue identifier.
     pub sub_queue_id: u32,
     /// Redelivery-attempt metadata.
     pub rda_info: RdaInfo,
-}
-
-impl Default for SubQueueInfo {
-    fn default() -> Self {
-        Self {
-            sub_queue_id: 0,
-            rda_info: RdaInfo::default(),
-        }
-    }
 }
 
 /// Per-message header inside a `PUT` event.
@@ -1342,7 +1333,7 @@ struct DecodedPushOptions {
 }
 
 fn decode_sub_queue_infos(payload: &[u8], item_size: usize) -> Result<Vec<SubQueueInfo>> {
-    if item_size < 8 || payload.len() % item_size != 0 {
+    if item_size < 8 || !payload.len().is_multiple_of(item_size) {
         return Err(Error::Protocol("sub-queue option payload is malformed"));
     }
 
@@ -1388,7 +1379,7 @@ fn decode_push_options(data: &[u8]) -> Result<DecodedPushOptions> {
                 }
             }
             OptionType::SubQueueIdsOld => {
-                if header.packed || body.len() % WORD_SIZE != 0 {
+                if header.packed || !body.len().is_multiple_of(WORD_SIZE) {
                     return Err(Error::Protocol("legacy sub-queue option is malformed"));
                 }
                 out.sub_queue_infos = body
@@ -1593,6 +1584,12 @@ impl ConfirmHeader {
         buf.put_u8((self.header_words << 4) | (self.per_message_words & 0x0f));
         buf.put_u8(0);
         buf.put_u16(0);
+    }
+}
+
+impl Default for ConfirmHeader {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

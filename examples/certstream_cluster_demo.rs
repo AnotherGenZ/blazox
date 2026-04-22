@@ -818,7 +818,7 @@ async fn publish_sampled_event(
     };
 
     *seen_market_events += 1;
-    if *seen_market_events <= 5 || *seen_market_events % 25 == 0 {
+    if *seen_market_events <= 5 || (*seen_market_events).is_multiple_of(25) {
         info!(
             seen_market_events = *seen_market_events,
             shared_topic = event.shared_topic.label,
@@ -829,7 +829,7 @@ async fn publish_sampled_event(
         );
     }
 
-    let sampled = *seen_market_events % sample_every == 0;
+    let sampled = (*seen_market_events).is_multiple_of(sample_every);
 
     if event.message_type == "heartbeat" || sampled {
         let shared_event = event.routed("work-queue", event.shared_topic.label);

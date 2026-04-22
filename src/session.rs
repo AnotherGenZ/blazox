@@ -1682,16 +1682,16 @@ impl SessionInner {
         }
 
         if let Some(handle) = handle {
-            if let Ok(client) = self.wait_for_client().await {
-                if let Some(params) = options.suspended_queue_stream_parameters() {
-                    let _ = self
-                        .with_trace(
-                            TraceOperationKind::ConfigureQueue,
-                            Some(&queue.uri),
-                            client.configure_queue_stream(handle.queue_id, params),
-                        )
-                        .await;
-                }
+            if let Ok(client) = self.wait_for_client().await
+                && let Some(params) = options.suspended_queue_stream_parameters()
+            {
+                let _ = self
+                    .with_trace(
+                        TraceOperationKind::ConfigureQueue,
+                        Some(&queue.uri),
+                        client.configure_queue_stream(handle.queue_id, params),
+                    )
+                    .await;
             }
             let _ = self
                 .with_trace(

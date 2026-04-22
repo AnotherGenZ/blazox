@@ -125,17 +125,8 @@ async fn main() -> blazox::Result<()> {
                 .flatten()
         })
         .unwrap_or(default_queue_uri()?);
-    let skip_auth = std::env::var("BLAZOX_SKIP_AUTH")
-        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
     let auth_mode = std::env::var("BLAZOX_AUTH")
-        .unwrap_or_else(|_| {
-            if skip_auth {
-                "skip".to_string()
-            } else {
-                "skip".to_string()
-            }
-        })
+        .unwrap_or_else(|_| "skip".to_string())
         .to_ascii_lowercase();
     let auth_timeout = std::env::var("BLAZOX_AUTH_TIMEOUT_MS")
         .ok()

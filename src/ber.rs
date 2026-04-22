@@ -310,7 +310,7 @@ fn describe_segments(payload: &[u8]) -> String {
     parts.join(", ")
 }
 
-fn expect_sequence_root<'a>(payload: &'a [u8]) -> Result<&'a [u8]> {
+fn expect_sequence_root(payload: &[u8]) -> Result<&[u8]> {
     let root = parse_root(payload)?;
     if root.class != BerClass::Universal || !root.constructed || root.tag != UNIVERSAL_SEQUENCE_TAG
     {
@@ -2224,6 +2224,7 @@ impl BerCodec for AuthenticationMessage {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 

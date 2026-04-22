@@ -315,6 +315,7 @@ pub enum InboundSchemaEvent {
 /// Unlike [`crate::session::SessionEvent`], these events are not routed to a
 /// particular queue registry and do not imply reconnect or host-health logic.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum SessionEvent {
     /// Schema event such as control, negotiation, or authentication.
     Schema(InboundSchemaEvent),
@@ -439,13 +440,12 @@ impl QueueHandle {
         loop {
             let event =
                 recv_transport_event(&self.push_cursor, self.client.inner.request_timeout).await?;
-            if let SessionEvent::Push(messages) = event {
-                if let Some(message) = messages
+            if let SessionEvent::Push(messages) = event
+                && let Some(message) = messages
                     .into_iter()
                     .find(|message| message.header.queue_id == self.queue_id)
-                {
-                    return Ok(message);
-                }
+            {
+                return Ok(message);
             }
         }
     }
@@ -458,13 +458,12 @@ impl QueueHandle {
         loop {
             let event =
                 recv_transport_event(&self.ack_cursor, self.client.inner.request_timeout).await?;
-            if let SessionEvent::Ack(messages) = event {
-                if let Some(message) = messages
+            if let SessionEvent::Ack(messages) = event
+                && let Some(message) = messages
                     .into_iter()
                     .find(|message| message.queue_id == self.queue_id)
-                {
-                    return Ok(message);
-                }
+            {
+                return Ok(message);
             }
         }
     }
@@ -652,13 +651,13 @@ impl Client {
                 .await
                 .map_err(|_| Error::Timeout)?
                 .map_err(|_| Error::RequestCanceled)?;
-            if let SessionEvent::Schema(InboundSchemaEvent::Authentication(message)) = event {
-                if let AuthenticationPayload::AuthenticationResponse(response) = message.payload {
-                    if response.status.is_success() {
-                        return Ok(response);
-                    }
-                    return Err(Error::BrokerStatus(response.status));
+            if let SessionEvent::Schema(InboundSchemaEvent::Authentication(message)) = event
+                && let AuthenticationPayload::AuthenticationResponse(response) = message.payload
+            {
+                if response.status.is_success() {
+                    return Ok(response);
                 }
+                return Err(Error::BrokerStatus(response.status));
             }
         }
     }
@@ -982,10 +981,10 @@ impl Client {
     }
 
     async fn write_frame(&self, frame: Bytes) -> Result<()> {
-        if let Some(high_watermark) = self.inner.channel_high_watermark {
-            if frame.len() as u64 > high_watermark {
-                return Err(Error::BandwidthLimit);
-            }
+        if let Some(high_watermark) = self.inner.channel_high_watermark
+            && frame.len() as u64 > high_watermark
+        {
+            return Err(Error::BandwidthLimit);
         }
         let mut writer = self.inner.writer.lock().await;
         timeout(self.inner.channel_write_timeout, writer.write_all(&frame))
@@ -1021,10 +1020,10 @@ fn best_schema_encoding(features: &str) -> EncodingType {
     let Some(values) = feature_values(features, "PROTOCOL_ENCODING") else {
         return EncodingType::Json;
     };
-    if values.iter().any(|value| *value == "JSON") {
+    if values.contains(&"JSON") {
         return EncodingType::Json;
     }
-    if values.iter().any(|value| *value == "BER") {
+    if values.contains(&"BER") {
         return EncodingType::Ber;
     }
     EncodingType::Json
@@ -1140,17 +1139,16 @@ async fn handle_frame(client: &Client, frame: &[u8]) -> Result<()> {
 
 async fn handle_control_frame(client: &Client, header: EventHeader, payload: &[u8]) -> Result<()> {
     if let Ok(message) = decode_control_event::<ControlMessage>(&header, payload) {
-        if let Some(request_id) = message.r_id {
-            if let Some(sender) = client
+        if let Some(request_id) = message.r_id
+            && let Some(sender) = client
                 .inner
                 .pending_requests
                 .lock()
                 .await
                 .remove(&request_id)
-            {
-                let _ = sender.send(message);
-                return Ok(());
-            }
+        {
+            let _ = sender.send(message);
+            return Ok(());
         }
         let _ = client
             .inner
