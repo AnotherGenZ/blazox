@@ -172,6 +172,54 @@ async fn session_reconfigure_subscriptions_delivers_pending_messages() -> TestRe
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn session_reconfigure_can_clear_subscriptions() -> TestResult {
+    let Some(config) = skip_unless_live() else {
+        return Ok(());
+    };
+    if !config.enable_subscriptions {
+        return Ok(());
+    }
+
+    let uri = config.unique_uri("subscriptions-clear")?;
+    let producer_session = connect_session(&config).await?;
+    let consumer_session = connect_session(&config).await?;
+
+    let producer = producer_session
+        .open_queue(uri.as_str(), QueueOptions::writer())
+        .await?;
+    let consumer = consumer_session
+        .open_queue(
+            uri.as_str(),
+            reader_options().subscriptions(vec![int_subscription(1, "x >= 4")]),
+        )
+        .await?;
+    let mut consumer_events = consumer.events();
+
+    for value in 0..=5 {
+        producer
+            .post(PostMessage::new(format!("x: {value}")).properties(int_property("x", value)))
+            .await?;
+    }
+
+    assert_eq!(
+        recv_and_confirm_with_events(&consumer, &mut consumer_events, 2).await?,
+        vec!["x: 4", "x: 5"]
+    );
+
+    consumer
+        .reconfigure(QueueOptions::reader().clear_subscriptions())
+        .await?;
+
+    assert_eq!(
+        recv_and_confirm_with_events(&consumer, &mut consumer_events, 4).await?,
+        vec!["x: 0", "x: 1", "x: 2", "x: 3"]
+    );
+
+    disconnect_sessions(&config, &[&producer_session, &consumer_session]).await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn session_max_unconfirmed_messages_blocks_additional_delivery_until_confirm() -> TestResult {
     let Some(config) = skip_unless_live() else {
         return Ok(());

@@ -114,8 +114,7 @@ impl Config {
         let worker_name =
             std::env::var("BLAZOX_WORKER_NAME").unwrap_or_else(|_| "worker".to_string());
         let worker_processing_delay = Duration::from_millis(env_u64("BLAZOX_WORKER_DELAY_MS", 750));
-        let feature_processing_delay =
-            Duration::from_millis(env_u64("BLAZOX_FEATURE_DELAY_MS", 0));
+        let feature_processing_delay = Duration::from_millis(env_u64("BLAZOX_FEATURE_DELAY_MS", 0));
         let priority_consumer_priority = env_i32("BLAZOX_PRIORITY_CONSUMER_PRIORITY", 1);
         let priority_reconfigure_to = env_optional_i32("BLAZOX_PRIORITY_RECONFIGURE_TO");
         let priority_reconfigure_after =

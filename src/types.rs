@@ -433,6 +433,8 @@ pub struct QueueOptions {
     pub subscriptions: Vec<Subscription>,
     /// Whether the queue should suspend while the host is unhealthy.
     pub suspends_on_bad_host_health: bool,
+    subscriptions_set: bool,
+    suspends_on_bad_host_health_set: bool,
 }
 
 impl Default for QueueOptions {
@@ -449,6 +451,8 @@ impl Default for QueueOptions {
             app_id: None,
             subscriptions: Vec::new(),
             suspends_on_bad_host_health: false,
+            subscriptions_set: false,
+            suspends_on_bad_host_health_set: false,
         }
     }
 }
@@ -583,6 +587,18 @@ impl QueueOptions {
     /// prepared to receive based on message properties.
     pub fn subscriptions(mut self, value: Vec<Subscription>) -> Self {
         self.subscriptions = value;
+        self.subscriptions_set = true;
+        self
+    }
+
+    /// Explicitly clears all subscriptions during queue reconfiguration.
+    ///
+    /// This is distinct from simply omitting subscriptions from a
+    /// reconfigure request, which preserves the broker-side subscription
+    /// state.
+    pub fn clear_subscriptions(mut self) -> Self {
+        self.subscriptions.clear();
+        self.subscriptions_set = true;
         self
     }
 
@@ -593,6 +609,7 @@ impl QueueOptions {
     /// state as described by the official host-health documentation.
     pub fn suspends_on_bad_host_health(mut self, value: bool) -> Self {
         self.suspends_on_bad_host_health = value;
+        self.suspends_on_bad_host_health_set = true;
         self
     }
 
@@ -632,11 +649,10 @@ impl QueueOptions {
         })
     }
 
-    pub(crate) fn stream_parameters(&self) -> Option<StreamParameters> {
-        if self.subscriptions.is_empty() {
+    fn build_stream_parameters(&self, allow_empty_subscriptions: bool) -> Option<StreamParameters> {
+        if self.subscriptions.is_empty() && !allow_empty_subscriptions {
             return None;
         }
-
         let default_consumer = ConsumerInfo {
             max_unconfirmed_messages: self
                 .max_unconfirmed_messages
@@ -671,6 +687,17 @@ impl QueueOptions {
         })
     }
 
+    pub(crate) fn open_stream_parameters(&self) -> Option<StreamParameters> {
+        self.build_stream_parameters(false)
+    }
+
+    pub(crate) fn configure_stream_parameters(&self) -> Option<StreamParameters> {
+        if !self.has_explicit_subscriptions() {
+            return None;
+        }
+        self.build_stream_parameters(true)
+    }
+
     pub(crate) fn to_open_queue_options(&self) -> OpenQueueOptions {
         OpenQueueOptions {
             handle: QueueHandleConfig {
@@ -681,12 +708,48 @@ impl QueueOptions {
                 admin_count: self.admin_count,
             },
             configure_queue_stream: self.default_queue_stream_parameters(),
-            configure_stream: self.stream_parameters(),
+            configure_stream: self.open_stream_parameters(),
         }
+    }
+
+    pub(crate) fn merged_for_reconfigure(&self, patch: &Self) -> Result<Self> {
+        if patch.has_explicit_suspends_on_bad_host_health()
+            && patch.suspends_on_bad_host_health != self.suspends_on_bad_host_health
+        {
+            return Err(Error::InvalidConfiguration(
+                "suspends_on_bad_host_health cannot be reconfigured after open".to_string(),
+            ));
+        }
+
+        let mut merged = self.clone();
+        merged.max_unconfirmed_messages = patch
+            .max_unconfirmed_messages
+            .or(merged.max_unconfirmed_messages);
+        merged.max_unconfirmed_bytes = patch.max_unconfirmed_bytes.or(merged.max_unconfirmed_bytes);
+        merged.consumer_priority = patch.consumer_priority.or(merged.consumer_priority);
+        merged.consumer_priority_count = patch
+            .consumer_priority_count
+            .or(merged.consumer_priority_count);
+        if let Some(app_id) = &patch.app_id {
+            merged.app_id = Some(app_id.clone());
+        }
+        if patch.has_explicit_subscriptions() {
+            merged.subscriptions = patch.subscriptions.clone();
+            merged.subscriptions_set = true;
+        }
+        Ok(merged)
     }
 
     fn is_reader(&self) -> bool {
         self.flags.contains(QueueFlags::READ) || self.read_count > 0
+    }
+
+    fn has_explicit_subscriptions(&self) -> bool {
+        self.subscriptions_set || !self.subscriptions.is_empty()
+    }
+
+    fn has_explicit_suspends_on_bad_host_health(&self) -> bool {
+        self.suspends_on_bad_host_health_set || self.suspends_on_bad_host_health
     }
 
     fn sub_queue_id_info(&self) -> Option<SubQueueIdInfo> {
@@ -1405,5 +1468,47 @@ mod tests {
         assert_eq!(subscription.consumers[0].max_unconfirmed_bytes, 2048);
         assert_eq!(subscription.consumers[0].consumer_priority, 7);
         assert_eq!(subscription.consumers[0].consumer_priority_count, 3);
+    }
+
+    #[test]
+    fn explicit_subscription_clear_emits_empty_configure_stream() {
+        let stream = QueueOptions::reader()
+            .clear_subscriptions()
+            .configure_stream_parameters()
+            .expect("configure_stream");
+
+        assert_eq!(stream.app_id, "__default");
+        assert!(stream.subscriptions.is_empty());
+    }
+
+    #[test]
+    fn reconfigure_merge_preserves_unspecified_fields_and_allows_subscription_clear() {
+        let current = QueueOptions::reader()
+            .max_unconfirmed_messages(16)
+            .consumer_priority(7)
+            .subscriptions(vec![Subscription {
+                s_id: 42,
+                expression: Expression {
+                    version: ExpressionVersion::Version1,
+                    text: "x > 0".to_string(),
+                },
+                consumers: Vec::new(),
+            }]);
+        let patch = QueueOptions::reader().clear_subscriptions();
+
+        let merged = current.merged_for_reconfigure(&patch).expect("merged");
+        assert_eq!(merged.max_unconfirmed_messages, Some(16));
+        assert_eq!(merged.consumer_priority, Some(7));
+        assert!(merged.subscriptions.is_empty());
+        assert!(merged.configure_stream_parameters().is_some());
+    }
+
+    #[test]
+    fn reconfigure_merge_rejects_host_health_mode_change() {
+        let current = QueueOptions::reader().suspends_on_bad_host_health(true);
+        let patch = QueueOptions::reader().suspends_on_bad_host_health(false);
+
+        let err = current.merged_for_reconfigure(&patch).unwrap_err();
+        assert!(matches!(err, Error::InvalidConfiguration(_)));
     }
 }

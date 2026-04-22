@@ -347,7 +347,6 @@ struct SessionInner {
     events: broadcast::Sender<SessionEvent>,
     event_tx: mpsc::UnboundedSender<SessionEvent>,
     connection: watch::Sender<ConnectionState>,
-    message_dumping: Mutex<MessageDumpState>,
     watermark_monitor: Arc<EventWatermarkMonitor>,
 }
 
@@ -363,14 +362,6 @@ struct QueueState {
     events: broadcast::Sender<QueueEvent>,
     event_tx: mpsc::UnboundedSender<QueueEvent>,
     watermark_monitor: Arc<EventWatermarkMonitor>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum MessageDumpState {
-    Off,
-    On,
-    Remaining(usize),
-    Until(tokio::time::Instant),
 }
 
 struct EventWatermarkMonitor {
@@ -503,7 +494,6 @@ impl Session {
             events,
             event_tx,
             connection,
-            message_dumping: Mutex::new(MessageDumpState::Off),
             watermark_monitor,
         });
         let session = Self {
@@ -820,16 +810,6 @@ impl Session {
             .await
     }
 
-    /// Configures debug dumping of inbound and outbound protocol messages.
-    ///
-    /// Accepted values are `"on"`, `"off"`, a positive count such as `"10"`,
-    /// or a positive duration in seconds such as `"5s"`.
-    pub async fn configure_message_dumping(&self, command: impl AsRef<str>) -> Result<()> {
-        let state = parse_message_dump_command(command.as_ref())?;
-        *self.inner.message_dumping.lock().await = state;
-        Ok(())
-    }
-
     /// Alias for [`Session::disconnect`].
     ///
     /// The naming mirrors the official SDKs, where "stop" is the normal way to
@@ -871,14 +851,15 @@ impl Session {
             }
         }
 
-        if let Some(client) = client {
-            let _ = self
-                .inner
+        let disconnect_result = if let Some(client) = client {
+            self.inner
                 .with_trace(TraceOperationKind::Disconnect, None, client.disconnect())
-                .await;
-        }
+                .await
+        } else {
+            Ok(())
+        };
         self.inner.emit_session(SessionEvent::Disconnected);
-        Ok(())
+        disconnect_result
     }
 }
 
@@ -1365,14 +1346,14 @@ impl SessionInner {
     }
 
     async fn route_push(&self, message: PushMessage) {
-        self.maybe_dump_message("inbound_push", &message).await;
+        info!(target: "blazox::messages::push", payload = ?message);
         if let Some(queue) = self.lookup_queue(message.header.queue_id).await {
             queue.enqueue_event(QueueEvent::Message(message.into()));
         }
     }
 
     async fn route_ack(&self, ack: AckMessage) {
-        self.maybe_dump_message("inbound_ack", &ack).await;
+        info!(target: "blazox::messages::ack", payload = ?ack);
         if let Some(queue) = self.lookup_queue(ack.queue_id).await {
             queue.remove_pending_post(ack.message_guid).await;
             queue.enqueue_event(QueueEvent::Ack(ack.into()));
@@ -1387,7 +1368,6 @@ impl SessionInner {
     async fn handle_transport_event(self: &Arc<Self>, event: TransportEvent) {
         match event {
             TransportEvent::Schema(message) => {
-                self.maybe_dump_message("inbound_schema", &message).await;
                 self.emit_session(SessionEvent::Schema(message));
             }
             TransportEvent::Ack(messages) => {
@@ -1551,7 +1531,7 @@ impl SessionInner {
         let options = queue.options.lock().await.clone();
         validate_post_queue_state(&queue.uri, &options, queue.closed.load(Ordering::SeqCst))?;
         queue.buffer_pending_posts(&messages).await;
-        self.maybe_dump_message("outbound_put", &messages).await;
+        info!(target: "blazox::messages::put", payload = ?messages);
         let outbound = messages
             .iter()
             .cloned()
@@ -1591,7 +1571,7 @@ impl SessionInner {
                 .iter()
                 .map(|message| (message.message_guid, message.sub_queue_id))
                 .collect::<Vec<_>>();
-            self.maybe_dump_message("outbound_confirm", &wire).await;
+            info!(target: "blazox::messages::confirm", payload = ?wire);
             let result = self
                 .with_trace(
                     TraceOperationKind::Confirm,
@@ -1651,57 +1631,65 @@ impl SessionInner {
             return Err(Error::WriterClosed);
         }
 
-        *queue.options.lock().await = options.clone();
-        if options.suspends_on_bad_host_health && self.is_host_unhealthy() {
-            self.suspend_queue_for_host_health(queue).await?;
-            return Ok(());
-        }
+        let current = queue.options.lock().await.clone();
+        let merged = current.merged_for_reconfigure(&options)?;
 
-        if queue.suspended.load(Ordering::SeqCst) && !options.suspends_on_bad_host_health {
-            self.resume_queue_from_host_health(queue).await?;
+        if merged.suspends_on_bad_host_health && self.is_host_unhealthy() {
+            if queue.suspended.load(Ordering::SeqCst) {
+                *queue.options.lock().await = merged;
+                return Ok(());
+            }
+            self.suspend_queue_for_host_health(queue).await?;
+            *queue.options.lock().await = merged;
             return Ok(());
         }
 
         if queue.suspended.load(Ordering::SeqCst) {
+            *queue.options.lock().await = merged;
             return Ok(());
         }
 
-        self.apply_queue_configuration(queue, &options).await?;
+        self.apply_queue_configuration(queue, &merged).await?;
         self.flush_queue(queue).await?;
+        *queue.options.lock().await = merged;
         Ok(())
     }
 
     async fn close_queue(&self, queue: &Arc<QueueState>) -> Result<()> {
         queue.closed.store(true, Ordering::SeqCst);
-        let handle = queue.handle.lock().await.take();
+        let handle = queue.handle.lock().await.clone();
         let options = queue.options.lock().await.clone();
+        if let Some(handle) = handle {
+            if let Ok(client) = self.wait_for_client().await {
+                if let Some(params) = options.suspended_queue_stream_parameters() {
+                    let _ = self
+                        .with_trace(
+                            TraceOperationKind::ConfigureQueue,
+                            Some(&queue.uri),
+                            client.configure_queue_stream(handle.queue_id, params),
+                        )
+                        .await;
+                }
+                if let Err(error) = self
+                    .with_trace(
+                        TraceOperationKind::CloseQueue,
+                        Some(&queue.uri),
+                        handle.close(true),
+                    )
+                    .await
+                {
+                    queue.closed.store(false, Ordering::SeqCst);
+                    return Err(error);
+                }
+            }
+        }
+
+        queue.handle.lock().await.take();
         self.queues.lock().await.remove(&queue.key);
         self.queue_uris.lock().await.remove(queue.uri.as_str());
         if let Some(queue_id) = queue.queue_id() {
             self.queue_ids.lock().await.remove(&queue_id);
         }
-
-        if let Some(handle) = handle {
-            if let Ok(client) = self.wait_for_client().await
-                && let Some(params) = options.suspended_queue_stream_parameters()
-            {
-                let _ = self
-                    .with_trace(
-                        TraceOperationKind::ConfigureQueue,
-                        Some(&queue.uri),
-                        client.configure_queue_stream(handle.queue_id, params),
-                    )
-                    .await;
-            }
-            let _ = self
-                .with_trace(
-                    TraceOperationKind::CloseQueue,
-                    Some(&queue.uri),
-                    handle.close(true),
-                )
-                .await;
-        }
-
         queue.enqueue_event(QueueEvent::Closed);
         self.emit_session(SessionEvent::QueueClosed {
             uri: queue.uri.clone(),
@@ -1757,7 +1745,7 @@ impl SessionInner {
             )
             .await?;
         }
-        if let Some(params) = options.stream_parameters() {
+        if let Some(params) = options.configure_stream_parameters() {
             self.with_trace(
                 TraceOperationKind::ConfigureQueue,
                 Some(&queue.uri),
@@ -1815,41 +1803,6 @@ impl SessionInner {
         });
         self.flush_queue(queue).await?;
         Ok(())
-    }
-
-    async fn maybe_dump_message<T: std::fmt::Debug>(&self, direction: &str, value: &T) {
-        if !self.should_dump_message().await {
-            return;
-        }
-        info!(target: "blazox::messages", direction, payload = ?value);
-    }
-
-    async fn should_dump_message(&self) -> bool {
-        let mut state = self.message_dumping.lock().await;
-        match &mut *state {
-            MessageDumpState::Off => false,
-            MessageDumpState::On => true,
-            MessageDumpState::Remaining(remaining) => {
-                if *remaining == 0 {
-                    *state = MessageDumpState::Off;
-                    false
-                } else {
-                    *remaining -= 1;
-                    if *remaining == 0 {
-                        *state = MessageDumpState::Off;
-                    }
-                    true
-                }
-            }
-            MessageDumpState::Until(deadline) => {
-                if tokio::time::Instant::now() <= *deadline {
-                    true
-                } else {
-                    *state = MessageDumpState::Off;
-                    false
-                }
-            }
-        }
     }
 
     async fn dump_stats(&self) {
@@ -2035,40 +1988,6 @@ fn distributed_trace_baggage(kind: TraceOperationKind, queue: Option<&Uri>) -> T
         baggage.push(("bmq.queue_name".to_string(), queue.queue().to_string()));
     }
     baggage
-}
-
-fn parse_message_dump_command(command: &str) -> Result<MessageDumpState> {
-    let trimmed = command.trim();
-    if trimmed.eq_ignore_ascii_case("OFF") {
-        return Ok(MessageDumpState::Off);
-    }
-    if trimmed.eq_ignore_ascii_case("ON") {
-        return Ok(MessageDumpState::On);
-    }
-    if let Some(seconds) = trimmed.strip_suffix(['s', 'S']) {
-        let seconds = seconds.trim().parse::<u64>().map_err(|_| {
-            Error::InvalidConfiguration(format!("invalid message dump duration: {trimmed}"))
-        })?;
-        if seconds == 0 {
-            return Err(Error::InvalidConfiguration(
-                "message dump duration must be positive".to_string(),
-            ));
-        }
-        return Ok(MessageDumpState::Until(
-            tokio::time::Instant::now() + Duration::from_secs(seconds),
-        ));
-    }
-    let remaining = trimmed.parse::<usize>().map_err(|_| {
-        Error::InvalidConfiguration(format!(
-            "invalid message dumping command: expected ON, OFF, <count>, or <seconds>s, got {trimmed}"
-        ))
-    })?;
-    if remaining == 0 {
-        return Err(Error::InvalidConfiguration(
-            "message dump count must be positive".to_string(),
-        ));
-    }
-    Ok(MessageDumpState::Remaining(remaining))
 }
 
 fn post_to_outbound(message: PostMessage) -> OutboundPut {

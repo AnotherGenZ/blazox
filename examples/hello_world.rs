@@ -136,8 +136,6 @@ async fn main() -> blazox::Result<()> {
     let run_admin = std::env::var("BLAZOX_RUN_ADMIN")
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    let dump_messages = std::env::var("BLAZOX_DUMP_MESSAGES").ok();
-
     let host_health = Arc::new(ManualHostHealthMonitor::new());
     let trace_sink = Arc::new(LoggingTraceSink);
     let mut session_options = SessionOptions::default()
@@ -185,10 +183,9 @@ async fn main() -> blazox::Result<()> {
         }
     }
 
-    if let Some(command) = dump_messages.as_deref() {
-        session.configure_message_dumping(command).await?;
-        info!(command, "configured message dumping");
-    }
+    info!(
+        "enable protocol message logging with BLAZOX_LOG=blazox::messages::push=info,blazox::messages::ack=info,blazox::messages::put=info,blazox::messages::confirm=info"
+    );
 
     if run_admin {
         match session.admin_command("help").await {

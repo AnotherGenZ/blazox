@@ -8,7 +8,9 @@ This audit tracks `blazox` against:
 
 ## Verdict
 
-`blazox` now covers the documented client feature set with async Rust-native equivalents.
+`blazox` covers the core publish/consume/client-runtime surface with async
+Rust-native equivalents, but it does not yet fully match all documented SDK
+semantics.
 
 The public API is intentionally not a line-by-line port of the C++ or Java surface. It does expose Rust-native equivalents for most documented client capabilities:
 
@@ -126,18 +128,42 @@ This now includes queue metadata baggage on child spans, which is the important 
 
 ## Remaining Differences
 
-There are no known material feature gaps after the latest implementation pass. The remaining differences are deliberate API-shape choices:
+There are still a few material gaps and semantic differences:
 
-1. The public surface is async Rust-native rather than a literal C++/Java port.
+1. `configureQueue` parity is not complete.
+   - The Rust API now preserves unspecified flow-control and priority fields
+     across reconfigure operations and supports explicit subscription clearing.
+   - Remaining difference: the public `QueueOptions` shape is still Rust-first
+     rather than a direct port of the C++/Java `QueueOptions` patch model.
+
+2. Message-dumping uses Rust-native tracing rather than the upstream command API.
+   - `blazox` emits structured tracing events on targets such as
+     `blazox::messages::push`, `blazox::messages::ack`,
+     `blazox::messages::put`, and `blazox::messages::confirm`.
+   - It does not expose the upstream `configureMessageDumping` command parser.
+
+3. Session lifecycle parity is intentionally async Rust-native rather than a
+   line-by-line port.
+   - Futures and event streams are used where C++ and Java expose separate
+     synchronous and callback-heavy asynchronous entry points.
+   - Convenience APIs such as `startAsync`, `stopAsync`, and `finalizeStop`
+     are not exposed as distinct methods.
+
+4. The public surface is async Rust-native rather than a literal C++/Java port.
    - Futures and event streams are used where C++ and Java expose callback-heavy async methods.
    - Session-owned builder loaders map to cheap Rust constructors and helper methods.
 
-2. A few tuning knobs are advisory rather than exact mechanical ports.
+5. A few tuning knobs are advisory rather than exact mechanical ports.
    - `num_processing_threads` and `event_queue_low_watermark` do not force a direct thread-pool/event-queue implementation because that would be a poor fit for Tokio-based async execution.
 
-3. The distributed-trace abstraction is intentionally smaller than the full C++ class hierarchy.
+6. The distributed-trace abstraction is intentionally smaller than the full C++ class hierarchy.
    - It preserves the important semantics: current-span lookup, child-span creation, activation scopes, and queue-operation baggage.
 
 ## Bottom Line
 
-`blazox` now covers the documented BlazingMQ client feature set, protocol behavior, and high-level SDK workflows with async Rust-native APIs. The differences that remain are shape and tuning-model choices, not missing client capabilities.
+`blazox` is now a credible core Rust SDK for BlazingMQ, with working queue
+open/configure/close, publish/consume/confirm flows, reconnect handling,
+compression, flow control, fanout, broadcast, subscriptions, and host health.
+It still has a few documented parity gaps relative to the C++/Java SDKs, most
+notably in exact API-shape/lifecycle equivalence and other Rust-vs-upstream
+surface differences.
