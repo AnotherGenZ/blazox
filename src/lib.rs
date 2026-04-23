@@ -67,8 +67,9 @@
 //!   [`QueueOptions::suspends_on_bad_host_health`].
 //! - [Distributed Trace](https://bloomberg.github.io/blazingmq/docs/features/distributed_trace/)
 //!   maps to structured `tracing` spans around SDK operations plus opt-in
-//!   message trace propagation via [`SessionOptions::message_trace_propagation`]
-//!   and [`session::ReceivedMessage::handling_span`].
+//!   message trace propagation via the `trace-propagation` feature,
+//!   [`SessionOptions::message_trace_propagation`], and
+//!   [`session::ReceivedMessage::handling_span`].
 //! - [Compression](https://bloomberg.github.io/blazingmq/docs/features/compression/)
 //!   maps to [`CompressionAlgorithm`].
 #![warn(missing_docs)]

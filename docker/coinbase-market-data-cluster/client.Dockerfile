@@ -5,7 +5,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY examples ./examples
 
-RUN cargo build --release --example coinbase_market_data_cluster_demo
+RUN cargo build --release --example coinbase_market_data_cluster_demo --features "trace-propagation otel-exporter"
 
 FROM debian:bookworm-slim
 

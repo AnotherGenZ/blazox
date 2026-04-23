@@ -983,6 +983,8 @@ impl SessionOptions {
 
     /// Enables or disables trace-context propagation through message properties.
     ///
+    /// This requires the crate's `trace-propagation` feature.
+    ///
     /// When enabled, the session injects the current OpenTelemetry context from
     /// `tracing` into reserved message properties using the process-wide text-map
     /// propagator configured through `opentelemetry::global`. Consumers can then

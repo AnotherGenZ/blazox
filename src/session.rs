@@ -190,9 +190,11 @@ impl ReceivedMessage {
 
     /// Returns a span for application work triggered by this message.
     ///
-    /// If the message carries propagated trace context and the process has a
+    /// If the crate is built with the `trace-propagation` feature, the message
+    /// carries propagated trace context, and the process has a
     /// `tracing-opentelemetry` layer plus a configured text-map propagator,
     /// the returned span is created as a child of that remote context.
+    /// Otherwise, this returns a normal local span for handler work.
     pub fn handling_span(&self, operation: impl Into<String>) -> tracing::Span {
         crate::message_trace::handling_span(
             &self.properties,
@@ -2442,21 +2444,34 @@ fn post_to_outbound(message: PostMessage) -> OutboundPut {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "trace-propagation")]
     use opentelemetry::global;
+    #[cfg(feature = "trace-propagation")]
     use opentelemetry::propagation::TextMapCompositePropagator;
+    #[cfg(feature = "trace-propagation")]
     use opentelemetry::trace::TracerProvider as _;
+    #[cfg(feature = "trace-propagation")]
     use opentelemetry_sdk::propagation::{BaggagePropagator, TraceContextPropagator};
+    #[cfg(feature = "trace-propagation")]
     use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter, Tracer};
+    #[cfg(feature = "trace-propagation")]
     use std::sync::{Arc as StdArc, Mutex as StdMutex, OnceLock};
+    #[cfg(feature = "trace-propagation")]
     use tracing::instrument::WithSubscriber;
+    #[cfg(feature = "trace-propagation")]
     use tracing::level_filters::LevelFilter;
+    #[cfg(feature = "trace-propagation")]
     use tracing::{Instrument, Subscriber};
+    #[cfg(feature = "trace-propagation")]
     use tracing_opentelemetry::layer;
+    #[cfg(feature = "trace-propagation")]
     use tracing_subscriber::prelude::*;
 
+    #[cfg(feature = "trace-propagation")]
     #[derive(Clone, Default, Debug)]
     struct TestExporter(StdArc<StdMutex<Vec<SpanData>>>);
 
+    #[cfg(feature = "trace-propagation")]
     impl SpanExporter for TestExporter {
         async fn export(
             &self,
@@ -2470,6 +2485,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "trace-propagation")]
     fn test_tracer() -> (Tracer, SdkTracerProvider, TestExporter, impl Subscriber) {
         let exporter = TestExporter::default();
         let provider = SdkTracerProvider::builder()
@@ -2485,6 +2501,7 @@ mod tests {
         (tracer, provider, exporter, subscriber)
     }
 
+    #[cfg(feature = "trace-propagation")]
     fn propagation_lock() -> &'static StdMutex<()> {
         static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| StdMutex::new(()))
@@ -2736,6 +2753,7 @@ mod tests {
         assert!(matches!(err, Error::InvalidConfiguration(_)));
     }
 
+    #[cfg(feature = "trace-propagation")]
     #[tokio::test]
     async fn message_trace_propagation_restores_parent_for_received_message() {
         let _lock = propagation_lock().lock().unwrap();

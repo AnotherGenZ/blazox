@@ -3,6 +3,22 @@ use blazox::{
     QueueFlags, QueueOptions, Session, SessionOptions, Uri, UriBuilder,
 };
 use futures_util::{SinkExt, StreamExt};
+#[cfg(feature = "otel-exporter")]
+use opentelemetry::KeyValue;
+#[cfg(feature = "otel-exporter")]
+use opentelemetry::global;
+#[cfg(feature = "otel-exporter")]
+use opentelemetry::propagation::TextMapCompositePropagator;
+#[cfg(feature = "otel-exporter")]
+use opentelemetry::trace::TracerProvider as _;
+#[cfg(feature = "otel-exporter")]
+use opentelemetry_otlp::WithExportConfig;
+#[cfg(feature = "otel-exporter")]
+use opentelemetry_sdk::Resource;
+#[cfg(feature = "otel-exporter")]
+use opentelemetry_sdk::propagation::{BaggagePropagator, TraceContextPropagator};
+#[cfg(feature = "otel-exporter")]
+use opentelemetry_sdk::trace::SdkTracerProvider;
 use rustls::crypto::ring::default_provider;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -10,8 +26,12 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tracing::{error, info, warn};
+use tracing::{Instrument, error, info, info_span, warn};
+#[cfg(feature = "otel-exporter")]
+use tracing_opentelemetry::layer as otel_layer;
 use tracing_subscriber::EnvFilter;
+#[cfg(feature = "otel-exporter")]
+use tracing_subscriber::prelude::*;
 
 const SHARED_TOPICS: [TopicDefinition; 3] = [
     TopicDefinition {
@@ -86,6 +106,10 @@ struct Config {
     priority_reconfigure_to: Option<i32>,
     priority_reconfigure_after: Option<Duration>,
     request_timeout: Duration,
+    mock_market_data_interval: Duration,
+    otel_endpoint: Option<String>,
+    #[cfg_attr(not(feature = "otel-exporter"), allow(dead_code))]
+    otel_service_name: Option<String>,
 }
 
 impl Config {
@@ -120,6 +144,18 @@ impl Config {
         let priority_reconfigure_after =
             env_optional_u64("BLAZOX_PRIORITY_RECONFIGURE_AFTER_MS").map(Duration::from_millis);
         let request_timeout = Duration::from_millis(env_u64("BLAZOX_REQUEST_TIMEOUT_MS", 10_000));
+        let mock_market_data_interval =
+            Duration::from_millis(env_u64("BLAZOX_MOCK_MARKET_DATA_INTERVAL_MS", 250));
+        let otel_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+            .ok()
+            .or_else(|| std::env::var("BLAZOX_OTEL_EXPORTER_OTLP_ENDPOINT").ok())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let otel_service_name = std::env::var("OTEL_SERVICE_NAME")
+            .ok()
+            .or_else(|| std::env::var("BLAZOX_OTEL_SERVICE_NAME").ok())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
 
         Ok(Self {
             role,
@@ -137,6 +173,9 @@ impl Config {
             priority_reconfigure_to,
             priority_reconfigure_after,
             request_timeout,
+            mock_market_data_interval,
+            otel_endpoint,
+            otel_service_name,
         })
     }
 
@@ -167,6 +206,17 @@ impl Config {
             format!("ws://{rest}")
         } else {
             self.market_data_url.clone()
+        }
+    }
+
+    #[cfg_attr(not(feature = "otel-exporter"), allow(dead_code))]
+    fn otel_service_name(&self) -> String {
+        if let Some(value) = &self.otel_service_name {
+            return value.clone();
+        }
+        match self.role {
+            Role::Publisher => "blazox-coinbase-publisher".to_string(),
+            Role::Worker => format!("blazox-coinbase-{}", self.worker_name),
         }
     }
 }
@@ -221,7 +271,86 @@ struct WorkerQueues {
     fanout: Queue,
 }
 
-fn init_tracing() {
+#[cfg(feature = "otel-exporter")]
+struct TelemetryGuard {
+    provider: Option<SdkTracerProvider>,
+}
+
+#[cfg(feature = "otel-exporter")]
+impl Drop for TelemetryGuard {
+    fn drop(&mut self) {
+        if let Some(provider) = self.provider.take() {
+            let _ = provider.shutdown();
+        }
+    }
+}
+
+#[cfg(not(feature = "otel-exporter"))]
+struct TelemetryGuard;
+
+#[cfg(feature = "otel-exporter")]
+fn init_tracing(config: &Config) -> TelemetryGuard {
+    let filter = EnvFilter::try_from_default_env()
+        .or_else(|_| EnvFilter::try_new("info"))
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_target(false)
+        .compact()
+        .with_filter(filter);
+
+    if let Some(endpoint) = &config.otel_endpoint {
+        global::set_text_map_propagator(TextMapCompositePropagator::new(vec![
+            Box::new(TraceContextPropagator::new()),
+            Box::new(BaggagePropagator::new()),
+        ]));
+
+        let resource = Resource::builder_empty()
+            .with_attributes([
+                KeyValue::new("service.name", config.otel_service_name()),
+                KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+                KeyValue::new(
+                    "blazox.role",
+                    match config.role {
+                        Role::Publisher => "publisher",
+                        Role::Worker => "worker",
+                    },
+                ),
+                KeyValue::new("blazox.worker_name", config.worker_name.clone()),
+                KeyValue::new("blazox.broker_addr", config.broker_addr.clone()),
+            ])
+            .build();
+
+        let exporter = opentelemetry_otlp::SpanExporter::builder()
+            .with_tonic()
+            .with_endpoint(endpoint.clone())
+            .build()
+            .unwrap_or_else(|error| {
+                panic!("failed to build OTLP span exporter for endpoint {endpoint}: {error}")
+            });
+        let provider = SdkTracerProvider::builder()
+            .with_resource(resource)
+            .with_batch_exporter(exporter)
+            .build();
+        let tracer = provider.tracer("blazox.examples.coinbase");
+
+        let _ = tracing_subscriber::registry()
+            .with(fmt_layer)
+            .with(otel_layer().with_tracer(tracer))
+            .try_init();
+
+        info!(endpoint = %endpoint, service = %config.otel_service_name(), "OpenTelemetry tracing enabled");
+        return TelemetryGuard {
+            provider: Some(provider),
+        };
+    }
+
+    let _ = tracing_subscriber::registry().with(fmt_layer).try_init();
+    TelemetryGuard { provider: None }
+}
+
+#[cfg(not(feature = "otel-exporter"))]
+fn init_tracing(config: &Config) -> TelemetryGuard {
     let filter = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new("info"))
         .unwrap_or_else(|_| EnvFilter::new("info"));
@@ -231,6 +360,14 @@ fn init_tracing() {
         .with_target(false)
         .compact()
         .try_init();
+
+    if config.otel_endpoint.is_some() {
+        warn!(
+            "OTEL_EXPORTER_OTLP_ENDPOINT is set, but the example was built without the 'otel-exporter' feature"
+        );
+    }
+
+    TelemetryGuard
 }
 
 fn init_tls_crypto_provider() {
@@ -383,7 +520,8 @@ async fn connect_session_with_retry(config: &Config) -> Session {
         .close_queue_timeout(config.request_timeout)
         .disconnect_timeout(Duration::from_secs(5))
         .process_name_override("blazox-coinbase-compose")
-        .user_agent("blazox/examples/coinbase_market_data_cluster_demo");
+        .user_agent("blazox/examples/coinbase_market_data_cluster_demo")
+        .message_trace_propagation(true);
     let mut attempt = 0_u64;
 
     loop {
@@ -652,38 +790,118 @@ fn decode_market_event(payload: Value) -> blazox::Result<Option<MarketEvent>> {
     }))
 }
 
+fn mock_market_event(sequence: u64, product_id: &str) -> Value {
+    let timestamp = format!("2026-04-23T00:00:{:02}.000Z", sequence % 60);
+    match sequence % 3 {
+        0 => json!({
+            "type": "ticker",
+            "product_id": product_id,
+            "sequence": sequence,
+            "time": timestamp,
+            "price": format!("{:.2}", 100_000.0 + sequence as f64),
+            "best_bid": format!("{:.2}", 99_999.0 + sequence as f64),
+            "best_ask": format!("{:.2}", 100_001.0 + sequence as f64),
+        }),
+        1 => json!({
+            "type": "match",
+            "product_id": product_id,
+            "sequence": sequence,
+            "time": timestamp,
+            "side": if sequence.is_multiple_of(2) { "buy" } else { "sell" },
+            "price": format!("{:.2}", 100_000.0 + sequence as f64),
+            "size": "0.25",
+        }),
+        _ => json!({
+            "type": "heartbeat",
+            "product_id": product_id,
+            "sequence": sequence,
+            "time": timestamp,
+            "last_trade_id": sequence,
+        }),
+    }
+}
+
+async fn run_mock_publisher(
+    config: &Config,
+    queues: &PublisherQueues,
+    correlation_ids: &CorrelationIdGenerator,
+    seen_market_events: &mut u64,
+) -> blazox::Result<()> {
+    let mut sequence = 1_u64;
+    let interval = config
+        .mock_market_data_interval
+        .max(Duration::from_millis(10));
+    info!(
+        interval_ms = interval.as_millis() as u64,
+        products = ?config.product_ids,
+        "using synthetic Coinbase market data feed"
+    );
+
+    loop {
+        let product_id = &config.product_ids[((sequence - 1) as usize) % config.product_ids.len()];
+        let payload = mock_market_event(sequence, product_id);
+        publish_sampled_event(
+            queues,
+            payload,
+            config.publish_every_n.max(1),
+            correlation_ids,
+            seen_market_events,
+        )
+        .await?;
+        sequence += 1;
+        sleep(interval).await;
+    }
+}
+
 async fn post_market_event(
     queue: &Queue,
     event: &RoutedMarketEvent,
     correlation_ids: &CorrelationIdGenerator,
 ) -> blazox::Result<()> {
-    let payload = serde_json::to_string(event)
-        .map_err(|err| blazox::Error::ProtocolMessage(err.to_string()))?;
-    let properties = build_properties(event);
-    queue
-        .post(
-            PostMessage::new(payload)
-                .properties(properties)
-                .correlation_id(correlation_ids.next()),
-        )
-        .await?;
-    info!(
-        pipeline = event.pipeline,
-        topic = event.topic,
-        product_id = event.product_id,
-        message_type = event.message_type,
-        summary = event.summary,
-        "published market event"
+    let span = info_span!(
+        "coinbase.publish",
+        pipeline = %event.pipeline,
+        topic = %event.topic,
+        product_id = %event.product_id,
+        message_type = %event.message_type,
     );
-    Ok(())
+
+    async move {
+        let payload = serde_json::to_string(event)
+            .map_err(|err| blazox::Error::ProtocolMessage(err.to_string()))?;
+        let properties = build_properties(event);
+        queue
+            .post(
+                PostMessage::new(payload)
+                    .properties(properties)
+                    .correlation_id(correlation_ids.next()),
+            )
+            .await?;
+        info!(
+            pipeline = event.pipeline,
+            topic = event.topic,
+            product_id = event.product_id,
+            message_type = event.message_type,
+            summary = event.summary,
+            "published market event"
+        );
+        Ok(())
+    }
+    .instrument(span)
+    .await
 }
 
 async fn run_publisher(config: Config) -> blazox::Result<()> {
     let (_session, queues) = connect_publisher_with_retry(&config).await;
-    let websocket_url = config.websocket_url();
-    let sample_every = config.publish_every_n.max(1);
     let correlation_ids = CorrelationIdGenerator::default();
     let mut seen_market_events = 0_u64;
+    if config.market_data_url.starts_with("mock://") {
+        return run_mock_publisher(&config, &queues, &correlation_ids, &mut seen_market_events)
+            .await;
+    }
+
+    let websocket_url = config.websocket_url();
+    let sample_every = config.publish_every_n.max(1);
     let mut connect_attempt = 0_u64;
 
     loop {
@@ -816,44 +1034,56 @@ async fn publish_sampled_event(
         return Ok(());
     };
 
-    *seen_market_events += 1;
-    if *seen_market_events <= 5 || (*seen_market_events).is_multiple_of(25) {
-        info!(
-            seen_market_events = *seen_market_events,
-            shared_topic = event.shared_topic.label,
-            product_id = %event.product_id,
-            message_type = %event.message_type,
-            summary = %event.summary,
-            "decoded Coinbase market event"
-        );
+    let event_span = info_span!(
+        "coinbase.market_event",
+        shared_topic = event.shared_topic.label,
+        product_id = %event.product_id,
+        message_type = %event.message_type,
+        sequence = event.sequence.unwrap_or_default(),
+    );
+
+    async move {
+        *seen_market_events += 1;
+        if *seen_market_events <= 5 || (*seen_market_events).is_multiple_of(25) {
+            info!(
+                seen_market_events = *seen_market_events,
+                shared_topic = event.shared_topic.label,
+                product_id = %event.product_id,
+                message_type = %event.message_type,
+                summary = %event.summary,
+                "decoded Coinbase market event"
+            );
+        }
+
+        let sampled = (*seen_market_events).is_multiple_of(sample_every);
+
+        if event.message_type == "heartbeat" || sampled {
+            let shared_event = event.routed("work-queue", event.shared_topic.label);
+            let Some((_, queue)) = queues
+                .shared
+                .iter()
+                .find(|(candidate, _)| candidate.label == event.shared_topic.label)
+            else {
+                return Err(blazox::Error::ProtocolMessage(format!(
+                    "no shared queue configured for topic {}",
+                    event.shared_topic.label
+                )));
+            };
+            post_market_event(queue, &shared_event, correlation_ids).await?;
+
+            let fanout_event = event.routed("fanout", event.shared_topic.label);
+            post_market_event(&queues.fanout, &fanout_event, correlation_ids).await?;
+        }
+
+        if sampled {
+            let priority_event = event.routed("consumer-priority", PRIORITY_QUEUE.label);
+            post_market_event(&queues.priority, &priority_event, correlation_ids).await?;
+        }
+
+        Ok(())
     }
-
-    let sampled = (*seen_market_events).is_multiple_of(sample_every);
-
-    if event.message_type == "heartbeat" || sampled {
-        let shared_event = event.routed("work-queue", event.shared_topic.label);
-        let Some((_, queue)) = queues
-            .shared
-            .iter()
-            .find(|(candidate, _)| candidate.label == event.shared_topic.label)
-        else {
-            return Err(blazox::Error::ProtocolMessage(format!(
-                "no shared queue configured for topic {}",
-                event.shared_topic.label
-            )));
-        };
-        post_market_event(queue, &shared_event, correlation_ids).await?;
-
-        let fanout_event = event.routed("fanout", event.shared_topic.label);
-        post_market_event(&queues.fanout, &fanout_event, correlation_ids).await?;
-    }
-
-    if sampled {
-        let priority_event = event.routed("consumer-priority", PRIORITY_QUEUE.label);
-        post_market_event(&queues.priority, &priority_event, correlation_ids).await?;
-    }
-
-    Ok(())
+    .instrument(event_span)
+    .await
 }
 
 fn spawn_reader_task(
@@ -869,6 +1099,8 @@ fn spawn_reader_task(
             match queue.next_message().await {
                 Ok(message) => {
                     let cookie = message.confirmation_cookie();
+                    let handling_span = message.handling_span("coinbase.process");
+                    let _guard = handling_span.enter();
                     match serde_json::from_slice::<RoutedMarketEvent>(&message.payload) {
                         Ok(event) => {
                             info!(
@@ -876,6 +1108,9 @@ fn spawn_reader_task(
                                 broker = %broker_addr,
                                 pipeline,
                                 queue = queue_label,
+                                queue_id = message.queue_id,
+                                sub_queue_id = message.sub_queue_id,
+                                message_guid = ?message.message_guid,
                                 topic = %event.topic,
                                 message_type = %event.message_type,
                                 product_id = %event.product_id,
@@ -889,6 +1124,9 @@ fn spawn_reader_task(
                                 broker = %broker_addr,
                                 pipeline,
                                 queue = queue_label,
+                                queue_id = message.queue_id,
+                                sub_queue_id = message.sub_queue_id,
+                                message_guid = ?message.message_guid,
                                 error = %err,
                                 "failed to decode queued message"
                             );
@@ -1031,10 +1269,9 @@ async fn run_worker(config: Config) -> blazox::Result<()> {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> blazox::Result<()> {
-    init_tracing();
-    init_tls_crypto_provider();
-
     let config = Config::from_env()?;
+    let _telemetry = init_tracing(&config);
+    init_tls_crypto_provider();
     match config.role {
         Role::Publisher => run_publisher(config).await,
         Role::Worker => run_worker(config).await,

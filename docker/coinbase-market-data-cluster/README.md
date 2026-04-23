@@ -6,8 +6,16 @@ This example starts:
 - `publisher`: a `blazox` client connected to `broker-a`
 - `worker-a`: a `blazox` client connected to `broker-b`
 - `worker-b`: a `blazox` client connected to `broker-c`
+- `otel-collector`: an OpenTelemetry Collector receiving OTLP traces from the demo clients
+- `jaeger`: a Jaeger all-in-one instance for inspecting collected traces
 
-The publisher connects to Coinbase Exchange Market Data at `wss://ws-feed.exchange.coinbase.com`, subscribes to public channels for a small product set, and demonstrates BlazingMQ queueing plus a few operational features:
+By default, the compose stack uses the live Coinbase websocket feed. If you
+want a fully local, deterministic fallback for tracing or queue-behavior
+testing, set `BLAZOX_MARKET_DATA_URL=mock://coinbase` for the `publisher`
+service.
+
+The publisher subscribes to a small product set and demonstrates BlazingMQ
+queueing plus a few operational features:
 
 1. Shared work queues in the priority domain:
 
@@ -36,6 +44,9 @@ The fanout lane follows the upstream BlazingMQ pattern used in `~/Coding/blazing
 That means both workers receive the same `heartbeat` fanout copies, while `ticker` and `matches` are filtered per AppId by the broker.
 
 The publisher also opens its writer queues with producer acknowledgements enabled, the dedicated priority consumer performs an in-place runtime reconfigure to demonstrate failover, and the client setup path retries queue-open timeouts during broker warm-up instead of exiting the container.
+The demo clients also export OTLP traces to the local collector and use message
+trace propagation so worker processing spans are children of the corresponding
+publisher-side spans.
 
 ## Run
 
@@ -57,6 +68,7 @@ The first run takes time because Compose builds:
 - shared work-queue messages split across brokers
 - consumer-priority traffic moving from `worker-a` to `worker-b` after the runtime reconfigure
 - fanout deliveries arriving independently on `foo` and `bar`
+- Jaeger is available at `http://127.0.0.1:16687` so you can inspect traces across the publisher and worker services.
 
 - host ports `31114`, `31115`, and `31116` map to the three brokers if you want to inspect them manually.
 
@@ -64,7 +76,8 @@ The first run takes time because Compose builds:
 
 Useful environment variables are already set in the compose file:
 
-- `BLAZOX_MARKET_DATA_URL=wss://ws-feed.exchange.coinbase.com` points the publisher at the official Coinbase Exchange websocket feed.
+- `BLAZOX_MARKET_DATA_URL=wss://ws-feed.exchange.coinbase.com` uses the live Coinbase websocket feed. Change it to `mock://coinbase` to use the local synthetic fallback instead.
+- `BLAZOX_MOCK_MARKET_DATA_INTERVAL_MS=250` controls how quickly the synthetic publisher generates Coinbase-style payloads.
 - `BLAZOX_PRODUCT_IDS=BTC-USD,ETH-USD,SOL-USD` controls which products are subscribed on the `ticker`, `matches`, and `heartbeat` channels.
 - `BLAZOX_PUBLISH_EVERY_N=10` samples the live market data while still producing enough traffic to observe work-queue distribution.
 - `BLAZOX_FANOUT_DOMAIN=bmq.demo.persistent.fanout` controls the separate fanout domain used by `coinbase.fanout`.
@@ -73,5 +86,7 @@ Useful environment variables are already set in the compose file:
 - `BLAZOX_FEATURE_DELAY_MS=0` keeps the dedicated fanout and priority demo lanes responsive so they do not stall behind the shared queue delay.
 - `BLAZOX_PRIORITY_CONSUMER_PRIORITY` controls the dedicated `coinbase.priority` consumer tier for each worker.
 - `BLAZOX_PRIORITY_RECONFIGURE_AFTER_MS` and `BLAZOX_PRIORITY_RECONFIGURE_TO` let a worker change its consumer priority at runtime to demonstrate broker-side failover.
+- `OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317` points each demo client at the local OpenTelemetry Collector over OTLP/gRPC.
+- `OTEL_SERVICE_NAME=blazox-coinbase-*` labels spans so Jaeger separates publisher and worker traces by service.
 
 You can change those values directly in [docker-compose.yml](/home/angz/Coding/blazox/docker/coinbase-market-data-cluster/docker-compose.yml).

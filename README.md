@@ -127,7 +127,7 @@ The short version: `blazox` already covers the core publish, consume, confirm, a
 | Message properties | Supported | property encoding, decoding, and subscription filtering |
 | Compression | Supported | compressed payload posting and round-trip delivery |
 | Host health monitoring | Supported | queue suspension and restoration driven by a host-health monitor |
-| Distributed tracing | Supported | native `tracing` spans/events for SDK operations plus opt-in message trace propagation |
+| Distributed tracing | Supported | native `tracing` spans/events for SDK operations plus opt-in `trace-propagation` feature for message context propagation |
 | Anonymous authentication | Supported | session-level and client-level anonymous auth flows |
 | Admin commands | Supported | admin command round trips |
 | Protocol encodings | Supported | JSON and BER control-plane support |
@@ -166,7 +166,8 @@ This is useful for protocol tooling, debugging, specialized integrations, or sit
 
 SDK operations always emit native `tracing` spans and events. If you also want
 producer spans to continue across the broker boundary into consumer-side
-application code, enable message trace propagation explicitly:
+application code, enable the `trace-propagation` crate feature and then enable
+message trace propagation explicitly:
 
 ```rust
 let session = Session::connect(
@@ -175,6 +176,10 @@ let session = Session::connect(
         .message_trace_propagation(true),
 )
 .await?;
+```
+
+```toml
+blazox = { version = "...", features = ["trace-propagation"] }
 ```
 
 With that option enabled, outbound posts inject the current OpenTelemetry

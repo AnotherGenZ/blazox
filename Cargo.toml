@@ -3,6 +3,15 @@ name = "blazox"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+trace-propagation = ["dep:opentelemetry", "dep:tracing-opentelemetry"]
+otel-exporter = [
+    "trace-propagation",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+]
+
 [[example]]
 name = "hello_world"
 path = "examples/hello_world.rs"
@@ -18,7 +27,9 @@ crc32c = "0.6"
 flate2 = "1.1"
 futures-util = "0.3"
 gethostname = "1.0"
-opentelemetry = { version = "0.31", features = ["trace"] }
+opentelemetry = { version = "0.31", features = ["trace"], optional = true }
+opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic"], optional = true }
+opentelemetry_sdk = { version = "0.31", features = ["trace", "rt-tokio"], default-features = false, optional = true }
 rustls = { version = "0.23", features = ["ring"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -26,7 +37,7 @@ thiserror = "2.0"
 tokio = { version = "1.48", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 tracing = "0.1"
-tracing-opentelemetry = "0.32.1"
+tracing-opentelemetry = { version = "0.32.1", optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]

@@ -1343,9 +1343,11 @@ pub struct PushMessage {
 impl PushMessage {
     /// Returns a span for application work triggered by this message.
     ///
-    /// If the message carries propagated trace context and the process has a
+    /// If the crate is built with the `trace-propagation` feature, the message
+    /// carries propagated trace context, and the process has a
     /// `tracing-opentelemetry` layer plus a configured text-map propagator,
     /// the returned span is created as a child of that remote context.
+    /// Otherwise, this returns a normal local span for handler work.
     pub fn handling_span(&self, operation: impl Into<String>) -> tracing::Span {
         let sub_queue_id = self
             .sub_queue_infos
