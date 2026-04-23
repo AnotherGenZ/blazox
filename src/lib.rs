@@ -14,7 +14,8 @@
 //! - [`session`] is the higher-level client library layer. It builds the
 //!   operational behavior expected from a production SDK: reconnect,
 //!   queue-state restoration, queue-local event routing, host-health-aware
-//!   suspension, message confirmation helpers, and tracing hooks.
+//!   suspension, message confirmation helpers, and native `tracing`
+//!   integration.
 //! - [`schema`] models the control-plane messages (`OpenQueue`,
 //!   `ConfigureQueueStream`, `Disconnect`, authentication, negotiation, and
 //!   related responses).
@@ -65,13 +66,16 @@
 //!   maps to [`HostHealthMonitor`], [`ManualHostHealthMonitor`], and
 //!   [`QueueOptions::suspends_on_bad_host_health`].
 //! - [Distributed Trace](https://bloomberg.github.io/blazingmq/docs/features/distributed_trace/)
-//!   maps to structured `tracing` spans around SDK operations.
+//!   maps to structured `tracing` spans around SDK operations plus opt-in
+//!   message trace propagation via [`SessionOptions::message_trace_propagation`]
+//!   and [`session::ReceivedMessage::handling_span`].
 //! - [Compression](https://bloomberg.github.io/blazingmq/docs/features/compression/)
 //!   maps to [`CompressionAlgorithm`].
 #![warn(missing_docs)]
 
 mod ber;
 pub mod event;
+mod message_trace;
 
 /// Low-level asynchronous client for direct protocol access.
 ///

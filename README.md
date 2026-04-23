@@ -73,7 +73,7 @@ That example demonstrates:
 - posting messages with properties and compression
 - consuming queue events and confirming deliveries
 - host health suspension and resume behavior
-- tracing hooks
+- SDK tracing and opt-in message trace propagation
 
 See:
 
@@ -127,7 +127,7 @@ The short version: `blazox` already covers the core publish, consume, confirm, a
 | Message properties | Supported | property encoding, decoding, and subscription filtering |
 | Compression | Supported | compressed payload posting and round-trip delivery |
 | Host health monitoring | Supported | queue suspension and restoration driven by a host-health monitor |
-| Distributed tracing | Supported | native `tracing` spans/events for SDK operations |
+| Distributed tracing | Supported | native `tracing` spans/events for SDK operations plus opt-in message trace propagation |
 | Anonymous authentication | Supported | session-level and client-level anonymous auth flows |
 | Admin commands | Supported | admin command round trips |
 | Protocol encodings | Supported | JSON and BER control-plane support |
@@ -146,6 +146,7 @@ Use the high-level API if you want application-facing behavior rather than proto
 - reconnect handling and queue-state restoration
 - queue suspension on bad host health
 - structured `tracing` spans and events around queue operations
+- opt-in trace-context propagation through message properties
 
 For most application code, this is the correct starting point.
 
@@ -160,6 +161,37 @@ Use the low-level API if you want to work directly with the protocol and transpo
 - access to schema and wire structures
 
 This is useful for protocol tooling, debugging, specialized integrations, or situations where you want finer control than the session layer exposes.
+
+## Message Trace Propagation
+
+SDK operations always emit native `tracing` spans and events. If you also want
+producer spans to continue across the broker boundary into consumer-side
+application code, enable message trace propagation explicitly:
+
+```rust
+let session = Session::connect(
+    SessionOptions::default()
+        .broker_addr("127.0.0.1:30114")
+        .message_trace_propagation(true),
+)
+.await?;
+```
+
+With that option enabled, outbound posts inject the current OpenTelemetry
+context into reserved message properties such as `blazox.trace.traceparent`.
+On the consumer side, restore the remote parent when you begin handling a
+message:
+
+```rust
+let message = queue.next_message().await?;
+let span = message.handling_span("process_order");
+let _guard = span.enter();
+tracing::info!("processing message");
+```
+
+For full distributed traces, install a `tracing` subscriber that exports spans
+through OpenTelemetry and configure the process-wide text-map propagator via
+`opentelemetry::global`.
 
 ## Current Gaps And Differences
 

@@ -187,6 +187,21 @@ impl ReceivedMessage {
     pub fn confirmation_cookie(&self) -> MessageConfirmationCookie {
         MessageConfirmationCookie::new(self.queue_id, self.message_guid, self.sub_queue_id)
     }
+
+    /// Returns a span for application work triggered by this message.
+    ///
+    /// If the message carries propagated trace context and the process has a
+    /// `tracing-opentelemetry` layer plus a configured text-map propagator,
+    /// the returned span is created as a child of that remote context.
+    pub fn handling_span(&self, operation: impl Into<String>) -> tracing::Span {
+        crate::message_trace::handling_span(
+            &self.properties,
+            operation,
+            self.queue_id,
+            self.sub_queue_id,
+            self.message_guid,
+        )
+    }
 }
 
 /// Producer acknowledgement routed to a queue.
@@ -1625,7 +1640,7 @@ impl SessionInner {
     async fn post_packed_batch(
         self: &Arc<Self>,
         queue: &Arc<QueueState>,
-        messages: Vec<PostMessage>,
+        mut messages: Vec<PostMessage>,
     ) -> Result<()> {
         if messages.is_empty() {
             return Ok(());
@@ -1635,6 +1650,11 @@ impl SessionInner {
         }
         let options = queue.options.lock().await.clone();
         validate_post_queue_state(&queue.uri, &options, queue.closed.load(Ordering::SeqCst))?;
+        if self.options.message_trace_propagation {
+            for message in &mut messages {
+                crate::message_trace::inject_current_context(&mut message.properties);
+            }
+        }
         queue.buffer_pending_posts(&messages).await;
         let message_count = messages.len();
         let payload_bytes = messages
@@ -2422,6 +2442,53 @@ fn post_to_outbound(message: PostMessage) -> OutboundPut {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use opentelemetry::global;
+    use opentelemetry::propagation::TextMapCompositePropagator;
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::propagation::{BaggagePropagator, TraceContextPropagator};
+    use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter, Tracer};
+    use std::sync::{Arc as StdArc, Mutex as StdMutex, OnceLock};
+    use tracing::instrument::WithSubscriber;
+    use tracing::level_filters::LevelFilter;
+    use tracing::{Instrument, Subscriber};
+    use tracing_opentelemetry::layer;
+    use tracing_subscriber::prelude::*;
+
+    #[derive(Clone, Default, Debug)]
+    struct TestExporter(StdArc<StdMutex<Vec<SpanData>>>);
+
+    impl SpanExporter for TestExporter {
+        async fn export(
+            &self,
+            mut batch: Vec<SpanData>,
+        ) -> opentelemetry_sdk::error::OTelSdkResult {
+            let spans = self.0.clone();
+            if let Ok(mut inner) = spans.lock() {
+                inner.append(&mut batch);
+            }
+            Ok(())
+        }
+    }
+
+    fn test_tracer() -> (Tracer, SdkTracerProvider, TestExporter, impl Subscriber) {
+        let exporter = TestExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let tracer = provider.tracer("blazox-test");
+        let subscriber = tracing_subscriber::registry().with(
+            layer()
+                .with_tracer(tracer.clone())
+                .with_filter(LevelFilter::TRACE),
+        );
+
+        (tracer, provider, exporter, subscriber)
+    }
+
+    fn propagation_lock() -> &'static StdMutex<()> {
+        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| StdMutex::new(()))
+    }
 
     #[test]
     fn validate_outbound_posts_rejects_closed_readonly_empty_and_missing_correlation_id() {
@@ -2576,6 +2643,13 @@ mod tests {
     }
 
     async fn test_session_with_queue(queue_id: u32) -> (Session, Queue, Arc<QueueState>) {
+        test_session_with_queue_options(queue_id, SessionOptions::default()).await
+    }
+
+    async fn test_session_with_queue_options(
+        queue_id: u32,
+        options: SessionOptions,
+    ) -> (Session, Queue, Arc<QueueState>) {
         let events = EventHub::new();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let watermark_monitor = Arc::new(EventWatermarkMonitor::new(1, 8, events.clone()));
@@ -2583,7 +2657,7 @@ mod tests {
         spawn_session_event_dispatcher(event_rx, events.clone());
         let (connection, _) = watch::channel(ConnectionState::Connected);
         let inner = Arc::new(SessionInner {
-            options: SessionOptions::default(),
+            options,
             client: Mutex::new(None),
             guid_generator: SessionOptions::default()
                 .to_client_config()
@@ -2660,6 +2734,73 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::InvalidConfiguration(_)));
+    }
+
+    #[tokio::test]
+    async fn message_trace_propagation_restores_parent_for_received_message() {
+        let _lock = propagation_lock().lock().unwrap();
+        global::set_text_map_propagator(TextMapCompositePropagator::new(vec![
+            Box::new(TraceContextPropagator::new()),
+            Box::new(BaggagePropagator::new()),
+        ]));
+
+        let (_tracer, provider, exporter, subscriber) = test_tracer();
+        let (_session, queue, state) = test_session_with_queue_options(
+            7,
+            SessionOptions::default().message_trace_propagation(true),
+        )
+        .await;
+
+        let subscriber_guard = tracing::subscriber::set_default(subscriber);
+        async {
+            let producer = tracing::info_span!("producer");
+            let message = async {
+                queue.post(PostMessage::new("hello")).await.unwrap();
+
+                let pending = state.pending_posts.lock().await;
+                let posted = pending.iter_in_order().next().unwrap();
+                assert!(posted.properties.get("blazox.trace.traceparent").is_some());
+
+                ReceivedMessage {
+                    queue_id: 7,
+                    sub_queue_id: 0,
+                    rda_info: crate::wire::RdaInfo::default(),
+                    message_guid: posted.message_guid.unwrap(),
+                    payload: posted.payload.clone(),
+                    properties: posted.properties.clone(),
+                    properties_are_old_style: false,
+                    sub_queue_infos: Vec::new(),
+                    message_group_id: None,
+                    compression: posted.compression,
+                    flags: 0,
+                    schema_wire_id: 0,
+                }
+            }
+            .instrument(producer)
+            .await;
+
+            let handling_span = message.handling_span("process");
+            let _guard = handling_span.enter();
+            tracing::info!("processing message");
+        }
+        .with_current_subscriber()
+        .await;
+        drop(subscriber_guard);
+
+        drop(provider);
+
+        let spans = exporter.0.lock().unwrap();
+        let producer = spans.iter().find(|span| span.name == "producer").unwrap();
+        let handling = spans
+            .iter()
+            .find(|span| span.name == "blazox.message.handle")
+            .unwrap();
+
+        assert_eq!(
+            handling.span_context.trace_id(),
+            producer.span_context.trace_id()
+        );
+        assert_eq!(handling.parent_span_id, producer.span_context.span_id());
     }
 
     #[test]

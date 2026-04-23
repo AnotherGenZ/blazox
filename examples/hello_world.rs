@@ -243,6 +243,7 @@ async fn main() -> blazox::Result<()> {
                 acknowledgements.push(ack);
             }
             QueueEvent::Message(message) => {
+                let _handling_span = message.handling_span("hello_world.process").entered();
                 info!(
                     queue_id = message.queue_id,
                     sub_queue_id = message.sub_queue_id,

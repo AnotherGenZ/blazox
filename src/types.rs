@@ -734,6 +734,9 @@ pub struct SessionOptions {
     pub stats_dump_interval: Option<Duration>,
     /// Optional host health monitor installed on the session.
     pub host_health_monitor: Option<Arc<dyn HostHealthMonitor>>,
+    /// Whether outbound posts should inject the active trace context into
+    /// reserved message properties such as `blazox.trace.traceparent`.
+    pub message_trace_propagation: bool,
 }
 
 impl fmt::Debug for SessionOptions {
@@ -763,6 +766,7 @@ impl fmt::Debug for SessionOptions {
                 &self.event_queue_high_watermark,
             )
             .field("stats_dump_interval", &self.stats_dump_interval)
+            .field("message_trace_propagation", &self.message_trace_propagation)
             .finish_non_exhaustive()
     }
 }
@@ -793,6 +797,7 @@ impl Default for SessionOptions {
             event_queue_high_watermark: 512,
             stats_dump_interval: None,
             host_health_monitor: None,
+            message_trace_propagation: false,
         }
     }
 }
@@ -976,6 +981,19 @@ impl SessionOptions {
         self
     }
 
+    /// Enables or disables trace-context propagation through message properties.
+    ///
+    /// When enabled, the session injects the current OpenTelemetry context from
+    /// `tracing` into reserved message properties using the process-wide text-map
+    /// propagator configured through `opentelemetry::global`. Consumers can then
+    /// restore the remote parent with
+    /// [`crate::session::ReceivedMessage::handling_span`] or
+    /// [`crate::wire::PushMessage::handling_span`].
+    pub fn message_trace_propagation(mut self, value: bool) -> Self {
+        self.message_trace_propagation = value;
+        self
+    }
+
     pub(crate) fn to_client_config(&self) -> ClientConfig {
         let mut config = ClientConfig {
             request_timeout: self.request_timeout,
@@ -986,6 +1004,7 @@ impl SessionOptions {
             channel_write_timeout: self.channel_write_timeout,
             channel_high_watermark: self.channel_high_watermark,
             blob_buffer_size: self.blob_buffer_size,
+            message_trace_propagation: self.message_trace_propagation,
             session_id: self.session_id,
             features: self.features.clone(),
             ..ClientConfig::default()

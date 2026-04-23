@@ -103,6 +103,9 @@ pub struct ClientConfig {
     pub channel_high_watermark: Option<u64>,
     /// Buffer size used while reading frames from the broker.
     pub blob_buffer_size: usize,
+    /// Whether outbound publishes should inject the active trace context into
+    /// reserved message properties.
+    pub message_trace_propagation: bool,
     /// Client type advertised during negotiation.
     pub client_type: ClientType,
     /// Process name advertised during negotiation.
@@ -139,6 +142,7 @@ impl Default for ClientConfig {
             channel_write_timeout: Duration::from_secs(5),
             channel_high_watermark: None,
             blob_buffer_size: 64 * 1024,
+            message_trace_propagation: false,
             client_type: ClientType::TcpClient,
             process_name,
             host_name: gethostname::gethostname().to_string_lossy().into_owned(),
@@ -525,6 +529,7 @@ struct Inner {
     channel_write_timeout: Duration,
     channel_high_watermark: Option<u64>,
     blob_buffer_size: usize,
+    message_trace_propagation: bool,
     negotiated: BrokerResponse,
     encoding: EncodingType,
     guid_generator: MessageGuidGenerator,
@@ -609,6 +614,7 @@ impl Client {
                 channel_write_timeout: config.channel_write_timeout,
                 channel_high_watermark: config.channel_high_watermark,
                 blob_buffer_size: config.blob_buffer_size,
+                message_trace_propagation: config.message_trace_propagation,
                 negotiated: broker_response,
                 encoding,
                 guid_generator: config.message_guid_generator(),
@@ -1034,6 +1040,12 @@ impl Client {
     /// correlation id.  If the write fails, that temporary registration is
     /// rolled back.
     pub async fn publish_to_queue(&self, queue_id: u32, messages: Vec<OutboundPut>) -> Result<()> {
+        let mut messages = messages;
+        if self.inner.message_trace_propagation {
+            for message in &mut messages {
+                crate::message_trace::inject_current_context(&mut message.properties);
+            }
+        }
         let message_count = messages.len();
         let payload_bytes = messages
             .iter()

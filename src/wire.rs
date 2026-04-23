@@ -400,6 +400,20 @@ impl MessageProperties {
         });
     }
 
+    /// Inserts a property or replaces the existing value for that name.
+    pub fn insert_or_replace(&mut self, name: impl Into<String>, value: MessagePropertyValue) {
+        let name = name.into();
+        if let Some(property) = self
+            .properties
+            .iter_mut()
+            .find(|property| property.name == name)
+        {
+            property.value = value;
+            return;
+        }
+        self.push(MessageProperty { name, value });
+    }
+
     /// Returns the first property matching `name`.
     pub fn get(&self, name: &str) -> Option<&MessagePropertyValue> {
         self.properties
@@ -1324,6 +1338,28 @@ pub struct PushMessage {
     pub sub_queue_infos: Vec<SubQueueInfo>,
     /// Optional message group id carried in message options.
     pub message_group_id: Option<String>,
+}
+
+impl PushMessage {
+    /// Returns a span for application work triggered by this message.
+    ///
+    /// If the message carries propagated trace context and the process has a
+    /// `tracing-opentelemetry` layer plus a configured text-map propagator,
+    /// the returned span is created as a child of that remote context.
+    pub fn handling_span(&self, operation: impl Into<String>) -> tracing::Span {
+        let sub_queue_id = self
+            .sub_queue_infos
+            .first()
+            .map(|info| info.sub_queue_id)
+            .unwrap_or_default();
+        crate::message_trace::handling_span(
+            &self.properties,
+            operation,
+            self.header.queue_id,
+            sub_queue_id,
+            self.header.message_guid,
+        )
+    }
 }
 
 #[derive(Debug, Default)]
