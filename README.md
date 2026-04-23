@@ -20,7 +20,7 @@ BlazingMQ is a durable, highly available message queueing system designed for lo
 - subscriptions driven by message properties
 - payload compression
 - host health monitoring
-- distributed tracing hooks
+- structured tracing spans and events
 
 At a system level, applications connect to BlazingMQ brokers and exchange data through named queues using producer and consumer clients. `blazox` is the Rust-side client implementation for those workflows.
 
@@ -127,7 +127,7 @@ The short version: `blazox` already covers the core publish, consume, confirm, a
 | Message properties | Supported | property encoding, decoding, and subscription filtering |
 | Compression | Supported | compressed payload posting and round-trip delivery |
 | Host health monitoring | Supported | queue suspension and restoration driven by a host-health monitor |
-| Distributed tracing hooks | Supported | `TraceSink`, distributed trace context, tracer integration |
+| Distributed tracing | Supported | native `tracing` spans/events for SDK operations |
 | Anonymous authentication | Supported | session-level and client-level anonymous auth flows |
 | Admin commands | Supported | admin command round trips |
 | Protocol encodings | Supported | JSON and BER control-plane support |
@@ -145,7 +145,7 @@ Use the high-level API if you want application-facing behavior rather than proto
 - confirmation builders and helpers
 - reconnect handling and queue-state restoration
 - queue suspension on bad host health
-- trace hooks around queue operations
+- structured `tracing` spans and events around queue operations
 
 For most application code, this is the correct starting point.
 

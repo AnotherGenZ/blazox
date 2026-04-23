@@ -65,7 +65,7 @@
 //!   maps to [`HostHealthMonitor`], [`ManualHostHealthMonitor`], and
 //!   [`QueueOptions::suspends_on_bad_host_health`].
 //! - [Distributed Trace](https://bloomberg.github.io/blazingmq/docs/features/distributed_trace/)
-//!   maps to [`TraceSink`], [`DistributedTracer`], and related traits.
+//!   maps to structured `tracing` spans around SDK operations.
 //! - [Compression](https://bloomberg.github.io/blazingmq/docs/features/compression/)
 //!   maps to [`CompressionAlgorithm`].
 #![warn(missing_docs)]
@@ -133,10 +133,9 @@ pub use session::{
 };
 pub use types::{
     AuthProvider, AuthRequestFuture, ConfirmBatch, ConfirmMessage, CorrelationId,
-    CorrelationIdGenerator, DistributedTraceContext, DistributedTraceScope, DistributedTraceSpan,
-    DistributedTracer, HostHealthMonitor, HostHealthState, ManualHostHealthMonitor,
+    CorrelationIdGenerator, HostHealthMonitor, HostHealthState, ManualHostHealthMonitor,
     MessageConfirmationCookie, PackedPostBatch, PostBatch, PostMessage, QueueFlags, QueueOptions,
-    SessionOptions, TraceBaggage, TraceOperation, TraceOperationKind, TraceSink, Uri, UriBuilder,
+    SessionOptions, Uri, UriBuilder,
 };
 pub use wire::{
     AckHeader, AckMessage, CompressionAlgorithm, ConfirmHeader,

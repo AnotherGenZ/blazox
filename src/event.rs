@@ -7,9 +7,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
-    Mutex,
 };
 use tokio::sync::Notify;
 
@@ -95,7 +94,11 @@ impl<T> EventHub<T> {
 
     /// Installs or replaces the metrics hook for this hub.
     pub fn set_metrics(&self, metrics: Arc<dyn EventHubMetrics>) {
-        let mut slot = self.inner.metrics.lock().expect("event hub metrics mutex poisoned");
+        let mut slot = self
+            .inner
+            .metrics
+            .lock()
+            .expect("event hub metrics mutex poisoned");
         *slot = Some(metrics);
     }
 

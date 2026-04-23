@@ -1,11 +1,12 @@
 mod support;
 
 use blazox::{
-    AckMessage, Client, OpenQueueOptions, OutboundPut, PushMessage, QueueHandleConfig,
-    EventReceiver, QueueStreamParameters, TransportEvent, queue_flags,
+    AckMessage, Client, EventReceiver, OpenQueueOptions, OutboundPut, PushMessage,
+    QueueHandleConfig, QueueStreamParameters, TransportEvent, queue_flags,
 };
 use std::time::Duration;
 use support::{TestResult, blazox_timeout, disconnect_client, skip_unless_live};
+use tracing::info;
 
 #[tokio::test(flavor = "current_thread")]
 async fn client_open_publish_push_confirm_close() -> TestResult {
@@ -14,21 +15,21 @@ async fn client_open_publish_push_confirm_close() -> TestResult {
     };
 
     let uri = config.unique_uri("client-round-trip")?;
-    eprintln!("client_open_publish_push_confirm_close: uri={}", uri);
+    info!(%uri, "starting live client round-trip test");
     let producer = blazox_timeout(
         config.request_timeout,
         "producer Client::connect",
         Client::connect(&config.addr, config.client_config()),
     )
     .await?;
-    eprintln!("producer connected");
+    info!("producer connected");
     let consumer = blazox_timeout(
         config.request_timeout,
         "consumer Client::connect",
         Client::connect(&config.addr, config.client_config()),
     )
     .await?;
-    eprintln!("consumer connected");
+    info!("consumer connected");
 
     let producer_handle = blazox_timeout(
         config.request_timeout,
@@ -36,14 +37,14 @@ async fn client_open_publish_push_confirm_close() -> TestResult {
         producer.open_queue(uri.as_str(), producer_open_options()),
     )
     .await?;
-    eprintln!("producer queue opened: {}", producer_handle.queue_id);
+    info!(queue_id = producer_handle.queue_id, "producer queue opened");
     let consumer_handle = blazox_timeout(
         config.request_timeout,
         "consumer.open_queue",
         consumer.open_queue(uri.as_str(), consumer_open_options()),
     )
     .await?;
-    eprintln!("consumer queue opened: {}", consumer_handle.queue_id);
+    info!(queue_id = consumer_handle.queue_id, "consumer queue opened");
     let mut producer_events = producer_handle.subscribe();
     let mut consumer_events = consumer_handle.subscribe();
 
@@ -54,7 +55,7 @@ async fn client_open_publish_push_confirm_close() -> TestResult {
             .publish(OutboundPut::new("hello from low-level client").with_correlation_id(7)),
     )
     .await?;
-    eprintln!("published");
+    info!("message published");
 
     let ack = next_client_ack(
         config.request_timeout,
@@ -62,7 +63,7 @@ async fn client_open_publish_push_confirm_close() -> TestResult {
         producer_handle.queue_id,
     )
     .await?;
-    eprintln!("ack received");
+    info!("producer acknowledgement received");
     assert_eq!(ack.correlation_id, 7);
 
     let push = next_client_push(
@@ -71,7 +72,7 @@ async fn client_open_publish_push_confirm_close() -> TestResult {
         consumer_handle.queue_id,
     )
     .await?;
-    eprintln!("push received");
+    info!("consumer push received");
     assert_eq!(
         String::from_utf8(push.payload.to_vec())?,
         "hello from low-level client"
@@ -82,7 +83,7 @@ async fn client_open_publish_push_confirm_close() -> TestResult {
         consumer_handle.confirm(push.header.message_guid, 0),
     )
     .await?;
-    eprintln!("confirm sent");
+    info!("consumer confirmation sent");
 
     blazox_timeout(
         config.request_timeout,
@@ -90,14 +91,14 @@ async fn client_open_publish_push_confirm_close() -> TestResult {
         producer_handle.close(true),
     )
     .await?;
-    eprintln!("producer queue closed");
+    info!("producer queue closed");
     blazox_timeout(
         config.request_timeout,
         "consumer_handle.close",
         consumer_handle.close(true),
     )
     .await?;
-    eprintln!("consumer queue closed");
+    info!("consumer queue closed");
     disconnect_client(&config, &producer).await;
     disconnect_client(&config, &consumer).await;
     Ok(())

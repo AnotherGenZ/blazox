@@ -10,7 +10,7 @@
 //!   events
 //! - host-health-driven queue suspension and resumption
 //! - message confirmation helpers and batching
-//! - optional operation tracing and distributed trace integration
+//! - optional operation tracing through structured spans and events
 //!
 //! The design follows the intent of the official
 //! [High Availability in Client Libraries](https://bloomberg.github.io/blazingmq/docs/architecture/high_availability_sdk/)
@@ -26,9 +26,8 @@ use crate::error::{Error, Result};
 use crate::event::{EventHub, EventHubMetrics, EventReceiver, RecvError};
 use crate::schema::{AuthenticationRequest, AuthenticationResponse};
 use crate::types::{
-    ConfirmBatch, ConfirmMessage, CorrelationId, DistributedTraceScope, HostHealthState,
-    MessageConfirmationCookie, PackedPostBatch, PostBatch, PostMessage, QueueOptions,
-    SessionOptions, TraceBaggage, TraceOperation, TraceOperationKind, Uri,
+    ConfirmBatch, ConfirmMessage, CorrelationId, HostHealthState, MessageConfirmationCookie,
+    PackedPostBatch, PostBatch, PostMessage, QueueOptions, SessionOptions, Uri,
 };
 use crate::wire::{AckMessage, MessageGuid, MessageGuidGenerator, PushMessage};
 use std::collections::{HashMap, VecDeque};
@@ -40,7 +39,7 @@ use std::sync::{
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc, watch};
 use tokio::time::{sleep, timeout};
-use tracing::info;
+use tracing::{Instrument, debug, info, info_span, trace, warn};
 
 /// Session-level events emitted by [`Session`].
 #[derive(Debug, Clone)]
@@ -245,6 +244,19 @@ enum ConnectionState {
     Connected,
     Reconnecting,
     Closed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OperationKind {
+    Connect,
+    Authenticate,
+    OpenQueue,
+    ConfigureQueue,
+    CloseQueue,
+    Disconnect,
+    Publish,
+    Confirm,
+    AdminCommand,
 }
 
 /// High-level reconnecting session API.
@@ -596,7 +608,7 @@ impl Session {
     pub async fn authenticate(&self, request: AuthenticationRequest) -> Result<()> {
         let client = self.inner.wait_for_client().await?;
         self.inner
-            .with_trace(TraceOperationKind::Authenticate, None, async {
+            .with_trace(OperationKind::Authenticate, None, async {
                 client.authenticate(request).await.map(|_| ())
             })
             .await?;
@@ -617,7 +629,7 @@ impl Session {
         let response = self
             .inner
             .with_trace(
-                TraceOperationKind::Authenticate,
+                OperationKind::Authenticate,
                 None,
                 client.authenticate(request),
             )
@@ -635,7 +647,7 @@ impl Session {
         let client = self.inner.wait_for_client().await?;
         self.inner
             .with_trace(
-                TraceOperationKind::AdminCommand,
+                OperationKind::AdminCommand,
                 None,
                 client.admin_command(command),
             )
@@ -723,7 +735,8 @@ impl Session {
         });
         if initially_suspended {
             state.enqueue_event(QueueEvent::Suspended);
-            self.inner.emit_session(SessionEvent::QueueSuspended { uri: uri.clone() });
+            self.inner
+                .emit_session(SessionEvent::QueueSuspended { uri: uri.clone() });
         }
 
         let queue = Queue {
@@ -871,7 +884,7 @@ impl Session {
 
         let disconnect_result = if let Some(client) = client {
             self.inner
-                .with_trace(TraceOperationKind::Disconnect, None, client.disconnect())
+                .with_trace(OperationKind::Disconnect, None, client.disconnect())
                 .await
         } else {
             Ok(())
@@ -1190,7 +1203,7 @@ impl SessionInner {
     async fn establish_client(&self) -> Result<Client> {
         let config = self.options.to_client_config();
         let client = self
-            .with_trace(TraceOperationKind::Connect, None, async {
+            .with_trace(OperationKind::Connect, None, async {
                 timeout(
                     self.options.connect_timeout,
                     Client::connect(&self.options.broker_addr, config),
@@ -1204,13 +1217,13 @@ impl SessionInner {
 
         if let Some(provider) = &self.options.auth_provider {
             let request = provider.authentication_request().await?;
-            self.with_trace(TraceOperationKind::Authenticate, None, async {
+            self.with_trace(OperationKind::Authenticate, None, async {
                 client.authenticate(request).await.map(|_| ())
             })
             .await?;
             self.emit_session(SessionEvent::Authenticated);
         } else if self.options.authenticate_anonymous {
-            self.with_trace(TraceOperationKind::Authenticate, None, async {
+            self.with_trace(OperationKind::Authenticate, None, async {
                 client.authenticate_anonymous().await.map(|_| ())
             })
             .await?;
@@ -1311,32 +1324,63 @@ impl SessionInner {
 
     async fn with_trace<T>(
         &self,
-        kind: TraceOperationKind,
+        kind: OperationKind,
         queue: Option<&Uri>,
         future: impl Future<Output = Result<T>>,
     ) -> Result<T> {
-        let operation = TraceOperation {
-            kind,
-            queue: queue.cloned(),
-        };
-        let _distributed_trace_scope = self.activate_distributed_trace(kind, queue);
-        if let Some(trace) = &self.options.trace_sink {
-            trace.operation_started(&operation);
-        }
-        match future.await {
-            Ok(value) => {
-                if let Some(trace) = &self.options.trace_sink {
-                    trace.operation_succeeded(&operation);
+        let operation_name = distributed_trace_operation_name(kind);
+        let queue_uri = queue
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let queue_domain = queue
+            .map(|value| value.domain().to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let queue_name = queue
+            .map(|value| value.queue().to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let span = info_span!(
+            target: "blazox::operations",
+            "bmq.operation",
+            operation = operation_name,
+            queue_uri = %queue_uri,
+            queue_domain = %queue_domain,
+            queue_name = %queue_name,
+        );
+
+        async move {
+            debug!(
+                target: "blazox::operations",
+                event = "operation_started",
+                operation = operation_name,
+                queue_uri = %queue_uri,
+                "session operation started"
+            );
+            match future.await {
+                Ok(value) => {
+                    debug!(
+                        target: "blazox::operations",
+                        event = "operation_succeeded",
+                        operation = operation_name,
+                        queue_uri = %queue_uri,
+                        "session operation succeeded"
+                    );
+                    Ok(value)
                 }
-                Ok(value)
-            }
-            Err(error) => {
-                if let Some(trace) = &self.options.trace_sink {
-                    trace.operation_failed(&operation, &error);
+                Err(error) => {
+                    warn!(
+                        target: "blazox::operations",
+                        event = "operation_failed",
+                        operation = operation_name,
+                        queue_uri = %queue_uri,
+                        %error,
+                        "session operation failed"
+                    );
+                    Err(error)
                 }
-                Err(error)
             }
         }
+        .instrument(span)
+        .await
     }
 
     async fn wait_for_client(&self) -> Result<Client> {
@@ -1363,31 +1407,35 @@ impl SessionInner {
         self.queues.lock().await.values().cloned().collect()
     }
 
-    fn activate_distributed_trace(
-        &self,
-        kind: TraceOperationKind,
-        queue: Option<&Uri>,
-    ) -> Option<Box<dyn DistributedTraceScope>> {
-        let context = self.options.trace_context.as_ref()?;
-        let tracer = self.options.tracer.as_ref()?;
-        let operation = distributed_trace_operation_name(kind);
-        let baggage = distributed_trace_baggage(kind, queue);
-        let span = tracer.create_child_span(context.current_span(), operation, &baggage)?;
-        Some(context.activate_span(span))
-    }
-
     async fn route_push(&self, message: PushMessage) {
-        info!(target: "blazox::messages::push", payload = ?message);
         if let Some(queue) = self.lookup_queue(message.header.queue_id).await {
             queue.enqueue_event(QueueEvent::Message(message.into()));
+        } else {
+            warn!(
+                target: "blazox::messages::push",
+                event = "push_unrouted",
+                queue_id = message.header.queue_id,
+                message_guid = ?message.header.message_guid,
+                payload_bytes = message.payload.len(),
+                "received push for unknown queue"
+            );
         }
     }
 
     async fn route_ack(&self, ack: AckMessage) {
-        info!(target: "blazox::messages::ack", payload = ?ack);
         if let Some(queue) = self.lookup_queue(ack.queue_id).await {
             queue.remove_pending_post(ack.message_guid).await;
             queue.enqueue_event(QueueEvent::Ack(ack.into()));
+        } else {
+            warn!(
+                target: "blazox::messages::ack",
+                event = "ack_unrouted",
+                queue_id = ack.queue_id,
+                message_guid = ?ack.message_guid,
+                correlation_id = ack.correlation_id,
+                status = ack.status,
+                "received acknowledgement for unknown queue"
+            );
         }
     }
 
@@ -1428,6 +1476,12 @@ impl SessionInner {
             return;
         }
 
+        warn!(
+            target: "blazox::session",
+            event = "reconnect_scheduled",
+            reason,
+            "session reconnect scheduled"
+        );
         let inner = self.clone();
         tokio::spawn(async move {
             inner.prepare_reconnect(reason).await;
@@ -1439,6 +1493,13 @@ impl SessionInner {
         self.started.store(false, Ordering::SeqCst);
         self.queue_ids.lock().await.clear();
         let queues = self.queue_snapshot().await;
+        debug!(
+            target: "blazox::session",
+            event = "reconnect_preparing",
+            reason,
+            queue_count = queues.len(),
+            "preparing session reconnect"
+        );
         for queue in &queues {
             queue.handle.lock().await.take();
             queue.last_queue_id.store(0, Ordering::Relaxed);
@@ -1485,6 +1546,12 @@ impl SessionInner {
         let queues = self.queue_snapshot().await;
         self.queue_ids.lock().await.clear();
         self.queue_uris.lock().await.clear();
+        debug!(
+            target: "blazox::session",
+            event = "queues_restoring",
+            queue_count = queues.len(),
+            "restoring queues after reconnect"
+        );
 
         for queue in queues {
             if queue.closed.load(Ordering::SeqCst) {
@@ -1493,7 +1560,7 @@ impl SessionInner {
             let options = queue.options.lock().await.clone();
             let handle = self
                 .with_trace(
-                    TraceOperationKind::OpenQueue,
+                    OperationKind::OpenQueue,
                     Some(&queue.uri),
                     client.open_queue(queue.uri.to_string(), options.to_open_queue_options()),
                 )
@@ -1569,7 +1636,34 @@ impl SessionInner {
         let options = queue.options.lock().await.clone();
         validate_post_queue_state(&queue.uri, &options, queue.closed.load(Ordering::SeqCst))?;
         queue.buffer_pending_posts(&messages).await;
-        info!(target: "blazox::messages::put", payload = ?messages);
+        let message_count = messages.len();
+        let payload_bytes = messages
+            .iter()
+            .map(|message| message.payload.len())
+            .sum::<usize>();
+        let correlation_count = messages
+            .iter()
+            .filter(|message| message.correlation_id.is_some())
+            .count();
+        let queue_id = queue.queue_id().unwrap_or_default();
+        debug!(
+            target: "blazox::messages::put",
+            event = "put_publish_requested",
+            queue_uri = %queue.uri,
+            queue_id,
+            message_count,
+            payload_bytes,
+            correlation_count,
+            "publishing message batch"
+        );
+        trace!(
+            target: "blazox::messages::put",
+            event = "put_publish_details",
+            queue_uri = %queue.uri,
+            queue_id,
+            messages = ?messages,
+            "publishing message batch details"
+        );
         let outbound = messages
             .iter()
             .cloned()
@@ -1579,7 +1673,7 @@ impl SessionInner {
         if let Some(handle) = queue.handle.lock().await.clone() {
             let result = self
                 .with_trace(
-                    TraceOperationKind::Publish,
+                    OperationKind::Publish,
                     Some(&queue.uri),
                     handle.publish_all(outbound),
                 )
@@ -1609,10 +1703,26 @@ impl SessionInner {
                 .iter()
                 .map(|message| (message.message_guid, message.sub_queue_id))
                 .collect::<Vec<_>>();
-            info!(target: "blazox::messages::confirm", payload = ?wire);
+            let queue_id = queue.queue_id().unwrap_or_default();
+            debug!(
+                target: "blazox::messages::confirm",
+                event = "confirm_send_requested",
+                queue_uri = %queue.uri,
+                queue_id,
+                message_count = wire.len(),
+                "sending confirmation batch"
+            );
+            trace!(
+                target: "blazox::messages::confirm",
+                event = "confirm_send_details",
+                queue_uri = %queue.uri,
+                queue_id,
+                confirmations = ?wire,
+                "sending confirmation batch details"
+            );
             let result = self
                 .with_trace(
-                    TraceOperationKind::Confirm,
+                    OperationKind::Confirm,
                     Some(&queue.uri),
                     handle.confirm_all(wire),
                 )
@@ -1645,12 +1755,20 @@ impl SessionInner {
             pending.iter_in_order().collect::<Vec<_>>()
         };
         if !pending_posts.is_empty() {
+            debug!(
+                target: "blazox::messages::put",
+                event = "put_replay_requested",
+                queue_uri = %queue.uri,
+                queue_id = handle.queue_id,
+                message_count = pending_posts.len(),
+                "replaying buffered messages after reconnect"
+            );
             let outbound = pending_posts
                 .into_iter()
                 .map(post_to_outbound)
                 .collect::<Vec<_>>();
             self.with_trace(
-                TraceOperationKind::Publish,
+                OperationKind::Publish,
                 Some(&queue.uri),
                 handle.publish_all(outbound),
             )
@@ -1690,6 +1808,14 @@ impl SessionInner {
         self.apply_queue_configuration(queue, &merged).await?;
         self.flush_queue(queue).await?;
         *queue.options.lock().await = merged;
+        info!(
+            target: "blazox::queue",
+            event = "queue_reconfigured",
+            queue_uri = %queue.uri,
+            queue_id = queue.queue_id().unwrap_or_default(),
+            suspended = queue.suspended.load(Ordering::SeqCst),
+            "queue reconfigured"
+        );
         Ok(())
     }
 
@@ -1703,7 +1829,7 @@ impl SessionInner {
             if let Some(params) = options.suspended_queue_stream_parameters() {
                 let _ = self
                     .with_trace(
-                        TraceOperationKind::ConfigureQueue,
+                        OperationKind::ConfigureQueue,
                         Some(&queue.uri),
                         client.configure_queue_stream(handle.queue_id, params),
                     )
@@ -1711,7 +1837,7 @@ impl SessionInner {
             }
             if let Err(error) = self
                 .with_trace(
-                    TraceOperationKind::CloseQueue,
+                    OperationKind::CloseQueue,
                     Some(&queue.uri),
                     handle.close(true),
                 )
@@ -1738,6 +1864,7 @@ impl SessionInner {
     }
 
     fn emit_session(&self, event: SessionEvent) {
+        log_session_event(&event);
         let _ = self.event_tx.send(event);
     }
 
@@ -1750,7 +1877,7 @@ impl SessionInner {
             let client = self.wait_for_client().await?;
             let result = self
                 .with_trace(
-                    TraceOperationKind::OpenQueue,
+                    OperationKind::OpenQueue,
                     Some(uri),
                     client.open_queue(uri.to_string(), options.to_open_queue_options()),
                 )
@@ -1776,7 +1903,7 @@ impl SessionInner {
         let client = self.wait_for_client().await?;
         if let Some(params) = options.default_queue_stream_parameters() {
             self.with_trace(
-                TraceOperationKind::ConfigureQueue,
+                OperationKind::ConfigureQueue,
                 Some(&queue.uri),
                 client.configure_queue_stream(handle.queue_id, params),
             )
@@ -1784,7 +1911,7 @@ impl SessionInner {
         }
         if let Some(params) = options.configure_stream_parameters() {
             self.with_trace(
-                TraceOperationKind::ConfigureQueue,
+                OperationKind::ConfigureQueue,
                 Some(&queue.uri),
                 client.configure_stream(handle.queue_id, params),
             )
@@ -1814,7 +1941,7 @@ impl SessionInner {
             return Ok(());
         };
         self.with_trace(
-            TraceOperationKind::ConfigureQueue,
+            OperationKind::ConfigureQueue,
             Some(&queue.uri),
             client.configure_queue_stream(handle.queue_id, params),
         )
@@ -1869,8 +1996,9 @@ impl SessionInner {
         for queue in &queues {
             pending_posts += queue.pending_posts.lock().await.len();
         }
-        info!(
+        debug!(
             target: "blazox::stats",
+            event = "session_stats",
             started = self.started.load(Ordering::SeqCst),
             reconnecting = self.reconnecting.load(Ordering::SeqCst),
             unhealthy = self.host_unhealthy.load(Ordering::SeqCst),
@@ -1881,7 +2009,7 @@ impl SessionInner {
             channel_high_watermark = self.options.channel_high_watermark,
             event_queue_low_watermark = self.options.event_queue_low_watermark,
             event_queue_high_watermark = self.options.event_queue_high_watermark,
-            "session_stats"
+            "session stats"
         );
     }
 }
@@ -1909,6 +2037,7 @@ impl QueueState {
     }
 
     fn enqueue_event(&self, event: QueueEvent) {
+        log_queue_event(&self.uri, &event);
         let _ = self.event_tx.send(event);
     }
 
@@ -2043,31 +2172,238 @@ fn reconnect_backoff(attempt: u32) -> Duration {
     Duration::from_millis((u64::from(attempt.min(10))) * 250)
 }
 
-fn distributed_trace_operation_name(kind: TraceOperationKind) -> &'static str {
-    match kind {
-        TraceOperationKind::Connect => "connect",
-        TraceOperationKind::Authenticate => "authenticate",
-        TraceOperationKind::OpenQueue => "open_queue",
-        TraceOperationKind::ConfigureQueue => "configure_queue",
-        TraceOperationKind::CloseQueue => "close_queue",
-        TraceOperationKind::Disconnect => "disconnect",
-        TraceOperationKind::Publish => "publish",
-        TraceOperationKind::Confirm => "confirm",
-        TraceOperationKind::AdminCommand => "admin_command",
+fn log_session_event(event: &SessionEvent) {
+    match event {
+        SessionEvent::Connected => {
+            info!(
+                target: "blazox::session",
+                event = "connected",
+                "session connected"
+            );
+        }
+        SessionEvent::Authenticated => {
+            info!(
+                target: "blazox::session",
+                event = "authenticated",
+                "session authenticated"
+            );
+        }
+        SessionEvent::Reconnecting { attempt, error } => {
+            warn!(
+                target: "blazox::session",
+                event = "reconnecting",
+                attempt,
+                %error,
+                "session reconnecting"
+            );
+        }
+        SessionEvent::Reconnected => {
+            info!(
+                target: "blazox::session",
+                event = "reconnected",
+                "session reconnected"
+            );
+        }
+        SessionEvent::Disconnected => {
+            info!(
+                target: "blazox::session",
+                event = "disconnected",
+                "session disconnected"
+            );
+        }
+        SessionEvent::TransportError(error) => {
+            warn!(
+                target: "blazox::session",
+                event = "transport_error",
+                %error,
+                "session transport error"
+            );
+        }
+        SessionEvent::HostHealthChanged(HostHealthState::Healthy) => {
+            info!(
+                target: "blazox::session::health",
+                event = "host_healthy",
+                "host health restored"
+            );
+        }
+        SessionEvent::HostHealthChanged(HostHealthState::Unhealthy) => {
+            warn!(
+                target: "blazox::session::health",
+                event = "host_unhealthy",
+                "host health degraded"
+            );
+        }
+        SessionEvent::QueueOpened { uri, queue_id } => {
+            info!(
+                target: "blazox::session::queue",
+                event = "queue_opened",
+                queue_uri = %uri,
+                queue_id,
+                "queue opened"
+            );
+        }
+        SessionEvent::QueueReopened { uri, queue_id } => {
+            info!(
+                target: "blazox::session::queue",
+                event = "queue_reopened",
+                queue_uri = %uri,
+                queue_id,
+                "queue reopened"
+            );
+        }
+        SessionEvent::QueueClosed { uri } => {
+            info!(
+                target: "blazox::session::queue",
+                event = "queue_closed",
+                queue_uri = %uri,
+                "queue closed"
+            );
+        }
+        SessionEvent::QueueSuspended { uri } => {
+            warn!(
+                target: "blazox::session::queue",
+                event = "queue_suspended",
+                queue_uri = %uri,
+                "queue suspended"
+            );
+        }
+        SessionEvent::QueueResumed { uri } => {
+            info!(
+                target: "blazox::session::queue",
+                event = "queue_resumed",
+                queue_uri = %uri,
+                "queue resumed"
+            );
+        }
+        SessionEvent::SlowConsumerHighWatermark { pending } => {
+            warn!(
+                target: "blazox::session::backpressure",
+                event = "slow_consumer_high_watermark",
+                pending,
+                "session event backlog crossed high watermark"
+            );
+        }
+        SessionEvent::SlowConsumerNormal { pending } => {
+            info!(
+                target: "blazox::session::backpressure",
+                event = "slow_consumer_normal",
+                pending,
+                "session event backlog returned to normal"
+            );
+        }
+        SessionEvent::Schema(schema) => {
+            trace!(
+                target: "blazox::session::schema",
+                event = "schema_event",
+                schema_kind = schema_event_kind(schema),
+                payload = ?schema,
+                "session schema event"
+            );
+        }
     }
 }
 
-fn distributed_trace_baggage(kind: TraceOperationKind, queue: Option<&Uri>) -> TraceBaggage {
-    let mut baggage = vec![(
-        "bmq.operation".to_string(),
-        distributed_trace_operation_name(kind).to_string(),
-    )];
-    if let Some(queue) = queue {
-        baggage.push(("bmq.queue_uri".to_string(), queue.to_string()));
-        baggage.push(("bmq.queue_domain".to_string(), queue.domain().to_string()));
-        baggage.push(("bmq.queue_name".to_string(), queue.queue().to_string()));
+fn log_queue_event(queue_uri: &Uri, event: &QueueEvent) {
+    match event {
+        QueueEvent::Opened { queue_id } => {
+            info!(
+                target: "blazox::queue",
+                event = "queue_opened",
+                queue_uri = %queue_uri,
+                queue_id,
+                "queue opened"
+            );
+        }
+        QueueEvent::Reopened { queue_id } => {
+            info!(
+                target: "blazox::queue",
+                event = "queue_reopened",
+                queue_uri = %queue_uri,
+                queue_id,
+                "queue reopened"
+            );
+        }
+        QueueEvent::Closed => {
+            info!(
+                target: "blazox::queue",
+                event = "queue_closed",
+                queue_uri = %queue_uri,
+                "queue closed"
+            );
+        }
+        QueueEvent::Suspended => {
+            warn!(
+                target: "blazox::queue",
+                event = "queue_suspended",
+                queue_uri = %queue_uri,
+                "queue suspended"
+            );
+        }
+        QueueEvent::Resumed => {
+            info!(
+                target: "blazox::queue",
+                event = "queue_resumed",
+                queue_uri = %queue_uri,
+                "queue resumed"
+            );
+        }
+        QueueEvent::Message(message) => {
+            debug!(
+                target: "blazox::messages::push",
+                event = "push_received",
+                queue_uri = %queue_uri,
+                queue_id = message.queue_id,
+                sub_queue_id = message.sub_queue_id,
+                message_guid = ?message.message_guid,
+                payload_bytes = message.payload.len(),
+                property_count = message.properties.len(),
+                compression = ?message.compression,
+                "queue message received"
+            );
+            trace!(
+                target: "blazox::messages::push",
+                event = "push_received_details",
+                queue_uri = %queue_uri,
+                payload = ?message,
+                "queue message details"
+            );
+        }
+        QueueEvent::Ack(ack) => {
+            debug!(
+                target: "blazox::messages::ack",
+                event = "ack_received",
+                queue_uri = %queue_uri,
+                queue_id = ack.queue_id,
+                message_guid = ?ack.message_guid,
+                correlation_id = ack.correlation_id.get(),
+                status = ack.status,
+                "producer acknowledgement received"
+            );
+        }
     }
-    baggage
+}
+
+fn schema_event_kind(event: &InboundSchemaEvent) -> &'static str {
+    match event {
+        InboundSchemaEvent::Control(_) => "control",
+        InboundSchemaEvent::Negotiation(_) => "negotiation",
+        InboundSchemaEvent::Authentication(_) => "authentication",
+        InboundSchemaEvent::UnknownJson(_) => "unknown_json",
+    }
+}
+
+fn distributed_trace_operation_name(kind: OperationKind) -> &'static str {
+    match kind {
+        OperationKind::Connect => "connect",
+        OperationKind::Authenticate => "authenticate",
+        OperationKind::OpenQueue => "open_queue",
+        OperationKind::ConfigureQueue => "configure_queue",
+        OperationKind::CloseQueue => "close_queue",
+        OperationKind::Disconnect => "disconnect",
+        OperationKind::Publish => "publish",
+        OperationKind::Confirm => "confirm",
+        OperationKind::AdminCommand => "admin_command",
+    }
 }
 
 fn post_to_outbound(message: PostMessage) -> OutboundPut {
@@ -2249,7 +2585,9 @@ mod tests {
         let inner = Arc::new(SessionInner {
             options: SessionOptions::default(),
             client: Mutex::new(None),
-            guid_generator: SessionOptions::default().to_client_config().message_guid_generator(),
+            guid_generator: SessionOptions::default()
+                .to_client_config()
+                .message_guid_generator(),
             queues: Mutex::new(HashMap::new()),
             queue_ids: Mutex::new(HashMap::new()),
             queue_uris: Mutex::new(HashMap::new()),

@@ -1,47 +1,13 @@
 use blazox::{
     CompressionAlgorithm, CorrelationIdGenerator, ManualHostHealthMonitor, MessageProperties,
     MessagePropertyValue, PostMessage, QueueEvent, QueueOptions, Session, SessionEvent,
-    SessionOptions, TraceOperation, TraceSink, Uri, UriBuilder,
+    SessionOptions, Uri, UriBuilder,
 };
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{sleep, timeout};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
-
-#[derive(Debug)]
-struct LoggingTraceSink;
-
-impl TraceSink for LoggingTraceSink {
-    fn operation_started(&self, operation: &TraceOperation) {
-        info!(
-            kind = ?operation.kind,
-            queue = display_queue(operation.queue.as_ref()),
-            "trace started"
-        );
-    }
-
-    fn operation_succeeded(&self, operation: &TraceOperation) {
-        info!(
-            kind = ?operation.kind,
-            queue = display_queue(operation.queue.as_ref()),
-            "trace ok"
-        );
-    }
-
-    fn operation_failed(&self, operation: &TraceOperation, error: &blazox::Error) {
-        error!(
-            kind = ?operation.kind,
-            queue = display_queue(operation.queue.as_ref()),
-            %error,
-            "trace failed"
-        );
-    }
-}
-
-fn display_queue(queue: Option<&Uri>) -> &str {
-    queue.map(Uri::as_str).unwrap_or("-")
-}
 
 fn default_queue_uri() -> blazox::Result<Uri> {
     UriBuilder::new()
@@ -137,7 +103,6 @@ async fn main() -> blazox::Result<()> {
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     let host_health = Arc::new(ManualHostHealthMonitor::new());
-    let trace_sink = Arc::new(LoggingTraceSink);
     let mut session_options = SessionOptions::default()
         .broker_addr(addr.clone())
         .request_timeout(Duration::from_secs(10))
@@ -146,8 +111,7 @@ async fn main() -> blazox::Result<()> {
         .process_name_override("blazox-hello-world")
         .host_name_override("localhost")
         .user_agent("blazox/examples/hello_world")
-        .host_health_monitor(host_health.clone())
-        .trace_sink(trace_sink);
+        .host_health_monitor(host_health.clone());
     session_options.features = "PROTOCOL_ENCODING:BER,JSON;MPS:MESSAGE_PROPERTIES_EX".to_string();
 
     let session = Session::connect(session_options).await?;
@@ -184,7 +148,7 @@ async fn main() -> blazox::Result<()> {
     }
 
     info!(
-        "enable protocol message logging with BLAZOX_LOG=blazox::messages::push=info,blazox::messages::ack=info,blazox::messages::put=info,blazox::messages::confirm=info"
+        "enable protocol message logging with BLAZOX_LOG=blazox::messages::push=debug,blazox::messages::ack=debug,blazox::messages::put=debug,blazox::messages::confirm=debug"
     );
 
     if run_admin {

@@ -46,6 +46,7 @@ use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{Mutex, oneshot};
 use tokio::time::timeout;
+use tracing::{debug, info, trace, warn};
 
 /// Raw queue flag helpers used by the protocol layer.
 pub mod queue_flags {
@@ -537,7 +538,14 @@ impl Client {
     /// responds with its own identity and status, and the resulting feature set
     /// determines whether later schema requests use JSON or BER.
     pub async fn connect(addr: impl AsRef<str>, config: ClientConfig) -> Result<Self> {
-        let stream = TcpStream::connect(addr.as_ref()).await?;
+        let addr = addr.as_ref().to_string();
+        debug!(
+            target: "blazox::client",
+            event = "connect_started",
+            addr = %addr,
+            "connecting client transport"
+        );
+        let stream = TcpStream::connect(&addr).await?;
         let (mut reader, mut writer) = stream.into_split();
 
         let client_identity = config.client_identity();
@@ -567,6 +575,21 @@ impl Client {
             return Err(Error::BrokerStatus(broker_response.result));
         }
         let encoding = best_schema_encoding(&broker_response.broker_identity.features);
+        info!(
+            target: "blazox::client",
+            event = "connected",
+            addr = %addr,
+            schema_encoding = ?encoding,
+            "client connected"
+        );
+        trace!(
+            target: "blazox::client",
+            event = "negotiation_details",
+            addr = %addr,
+            broker_features = %broker_response.broker_identity.features,
+            broker_response = ?broker_response,
+            "client negotiation completed"
+        );
 
         let events = EventHub::new();
         let event_cursor = Arc::new(Mutex::new(events.subscribe()));
@@ -647,6 +670,13 @@ impl Client {
         &self,
         request: AuthenticationRequest,
     ) -> Result<AuthenticationResponse> {
+        let mechanism = request.mechanism.clone();
+        debug!(
+            target: "blazox::client",
+            event = "authenticate_started",
+            mechanism = %mechanism,
+            "sending authentication request"
+        );
         let mut events = self.subscribe();
         let frame = encode_schema_event(
             &AuthenticationMessage {
@@ -665,8 +695,21 @@ impl Client {
                 && let AuthenticationPayload::AuthenticationResponse(response) = message.payload
             {
                 if response.status.is_success() {
+                    info!(
+                        target: "blazox::client",
+                        event = "authenticated",
+                        mechanism = %mechanism,
+                        "authentication succeeded"
+                    );
                     return Ok(response);
                 }
+                warn!(
+                    target: "blazox::client",
+                    event = "authenticate_failed",
+                    mechanism = %mechanism,
+                    status = ?response.status,
+                    "authentication failed"
+                );
                 return Err(Error::BrokerStatus(response.status));
             }
         }
@@ -690,16 +733,32 @@ impl Client {
     /// request/response mechanism, but their payload is opaque broker command
     /// text instead of a structured queue operation.
     pub async fn admin_command(&self, command: impl Into<String>) -> Result<String> {
+        let command = command.into();
+        debug!(
+            target: "blazox::client::control",
+            event = "admin_command_started",
+            command = %command,
+            "sending admin command"
+        );
         let response = self
             .send_control_request(
                 ControlPayload::AdminCommand(AdminCommand {
-                    command: command.into(),
+                    command: command.clone(),
                 }),
                 self.inner.request_timeout,
             )
             .await?;
         match response.payload {
-            ControlPayload::AdminCommandResponse(response) => Ok(response.text),
+            ControlPayload::AdminCommandResponse(response) => {
+                debug!(
+                    target: "blazox::client::control",
+                    event = "admin_command_succeeded",
+                    command = %command,
+                    response_bytes = response.text.len(),
+                    "admin command completed"
+                );
+                Ok(response.text)
+            }
             ControlPayload::Status(status) => Err(Error::BrokerStatus(status)),
             _ => Err(Error::UnexpectedSchema(
                 "admin command did not return adminCommandResponse",
@@ -729,6 +788,17 @@ impl Client {
             write_count: options.handle.write_count,
             admin_count: options.handle.admin_count,
         };
+        debug!(
+            target: "blazox::client::queue",
+            event = "open_queue_started",
+            queue_uri = %uri,
+            queue_id,
+            flags = handle_parameters.flags,
+            read_count = handle_parameters.read_count,
+            write_count = handle_parameters.write_count,
+            admin_count = handle_parameters.admin_count,
+            "opening queue"
+        );
 
         let response = self
             .send_control_request(
@@ -755,6 +825,14 @@ impl Client {
             self.configure_stream(queue_id, params).await?;
         }
 
+        info!(
+            target: "blazox::client::queue",
+            event = "queue_opened",
+            queue_uri = %uri,
+            queue_id,
+            "queue opened"
+        );
+
         Ok(QueueHandle {
             client: self.clone(),
             push_cursor: Arc::new(Mutex::new(self.subscribe())),
@@ -775,6 +853,14 @@ impl Client {
     /// that was returned during open so the broker can identify the handle
     /// being detached.
     pub async fn close_queue(&self, handle: &QueueHandle, is_final: bool) -> Result<()> {
+        debug!(
+            target: "blazox::client::queue",
+            event = "close_queue_started",
+            queue_uri = %handle.uri,
+            queue_id = handle.queue_id,
+            is_final,
+            "closing queue"
+        );
         let response = self
             .send_control_request(
                 ControlPayload::CloseQueue(CloseQueue {
@@ -793,7 +879,17 @@ impl Client {
             )
             .await?;
         match response.payload {
-            ControlPayload::CloseQueueResponse(Empty {}) => Ok(()),
+            ControlPayload::CloseQueueResponse(Empty {}) => {
+                info!(
+                    target: "blazox::client::queue",
+                    event = "queue_closed",
+                    queue_uri = %handle.uri,
+                    queue_id = handle.queue_id,
+                    is_final,
+                    "queue closed"
+                );
+                Ok(())
+            }
             ControlPayload::Status(status) => Err(Error::BrokerStatus(status)),
             _ => Err(Error::UnexpectedSchema(
                 "close queue did not return closeQueueResponse",
@@ -813,6 +909,19 @@ impl Client {
         queue_id: u32,
         params: QueueStreamParameters,
     ) -> Result<()> {
+        debug!(
+            target: "blazox::client::queue",
+            event = "configure_queue_stream_started",
+            queue_id,
+            "configuring queue stream"
+        );
+        trace!(
+            target: "blazox::client::queue",
+            event = "configure_queue_stream_details",
+            queue_id,
+            params = ?params,
+            "configuring queue stream details"
+        );
         let response = self
             .send_control_request(
                 ControlPayload::ConfigureQueueStream(ConfigureQueueStream {
@@ -823,7 +932,15 @@ impl Client {
             )
             .await?;
         match response.payload {
-            ControlPayload::ConfigureQueueStreamResponse(_) => Ok(()),
+            ControlPayload::ConfigureQueueStreamResponse(_) => {
+                debug!(
+                    target: "blazox::client::queue",
+                    event = "configure_queue_stream_succeeded",
+                    queue_id,
+                    "queue stream configured"
+                );
+                Ok(())
+            }
             ControlPayload::Status(status) => Err(Error::BrokerStatus(status)),
             _ => Err(Error::UnexpectedSchema(
                 "configureQueueStream did not return configureQueueStreamResponse",
@@ -838,6 +955,19 @@ impl Client {
     /// [Subscriptions](https://bloomberg.github.io/blazingmq/docs/features/subscriptions/)
     /// document.
     pub async fn configure_stream(&self, queue_id: u32, params: StreamParameters) -> Result<()> {
+        debug!(
+            target: "blazox::client::queue",
+            event = "configure_stream_started",
+            queue_id,
+            "configuring queue stream metadata"
+        );
+        trace!(
+            target: "blazox::client::queue",
+            event = "configure_stream_details",
+            queue_id,
+            params = ?params,
+            "configuring queue stream metadata details"
+        );
         let response = self
             .send_control_request(
                 ControlPayload::ConfigureStream(ConfigureStream {
@@ -848,7 +978,15 @@ impl Client {
             )
             .await?;
         match response.payload {
-            ControlPayload::ConfigureStreamResponse(_) => Ok(()),
+            ControlPayload::ConfigureStreamResponse(_) => {
+                debug!(
+                    target: "blazox::client::queue",
+                    event = "configure_stream_succeeded",
+                    queue_id,
+                    "queue stream metadata configured"
+                );
+                Ok(())
+            }
             ControlPayload::Status(status) => Err(Error::BrokerStatus(status)),
             _ => Err(Error::UnexpectedSchema(
                 "configureStream did not return configureStreamResponse",
@@ -862,6 +1000,11 @@ impl Client {
     /// without sending `Disconnect` is still possible at the transport level,
     /// but that is not what this method models.
     pub async fn disconnect(&self) -> Result<()> {
+        debug!(
+            target: "blazox::client",
+            event = "disconnect_started",
+            "disconnecting client"
+        );
         let response = self
             .send_control_request(
                 ControlPayload::Disconnect(Empty {}),
@@ -869,7 +1012,14 @@ impl Client {
             )
             .await?;
         match response.payload {
-            ControlPayload::DisconnectResponse(Empty {}) => Ok(()),
+            ControlPayload::DisconnectResponse(Empty {}) => {
+                info!(
+                    target: "blazox::client",
+                    event = "disconnected",
+                    "client disconnected"
+                );
+                Ok(())
+            }
             ControlPayload::Status(status) => Err(Error::BrokerStatus(status)),
             _ => Err(Error::UnexpectedSchema(
                 "disconnect did not return disconnectResponse",
@@ -884,6 +1034,31 @@ impl Client {
     /// correlation id.  If the write fails, that temporary registration is
     /// rolled back.
     pub async fn publish_to_queue(&self, queue_id: u32, messages: Vec<OutboundPut>) -> Result<()> {
+        let message_count = messages.len();
+        let payload_bytes = messages
+            .iter()
+            .map(|message| message.payload.len())
+            .sum::<usize>();
+        let correlation_count = messages
+            .iter()
+            .filter(|message| message.correlation_id.is_some())
+            .count();
+        debug!(
+            target: "blazox::messages::put",
+            event = "put_publish_requested",
+            queue_id,
+            message_count,
+            payload_bytes,
+            correlation_count,
+            "publishing low-level message batch"
+        );
+        trace!(
+            target: "blazox::messages::put",
+            event = "put_publish_details",
+            queue_id,
+            messages = ?messages,
+            "publishing low-level message batch details"
+        );
         let mut correlation_ids = Vec::new();
         let wire_messages = messages
             .into_iter()
@@ -934,6 +1109,14 @@ impl Client {
         message_guid: MessageGuid,
         sub_queue_id: u32,
     ) -> Result<()> {
+        debug!(
+            target: "blazox::messages::confirm",
+            event = "confirm_send_requested",
+            queue_id,
+            message_guid = ?message_guid,
+            sub_queue_id,
+            "sending low-level confirmation"
+        );
         let frame = encode_confirm_event(&[crate::wire::ConfirmMessage {
             queue_id,
             message_guid,
@@ -962,6 +1145,20 @@ impl Client {
         if messages.is_empty() {
             return Ok(());
         }
+        debug!(
+            target: "blazox::messages::confirm",
+            event = "confirm_send_requested",
+            queue_id,
+            message_count = messages.len(),
+            "sending low-level confirmation batch"
+        );
+        trace!(
+            target: "blazox::messages::confirm",
+            event = "confirm_send_details",
+            queue_id,
+            confirmations = ?messages,
+            "sending low-level confirmation batch details"
+        );
         let frame = encode_confirm_event(&messages)?;
         self.write_frame(frame).await
     }
@@ -972,6 +1169,13 @@ impl Client {
         request_timeout: Duration,
     ) -> Result<ControlMessage> {
         let request_id = self.inner.next_request_id.fetch_add(1, Ordering::Relaxed);
+        debug!(
+            target: "blazox::client::control",
+            event = "control_request_started",
+            request_id,
+            request_kind = control_payload_kind(&payload),
+            "sending control request"
+        );
         let message = ControlMessage::request(request_id, payload);
         let frame = encode_control_event(&message, self.inner.encoding)?;
         let (tx, rx) = oneshot::channel();
@@ -990,6 +1194,12 @@ impl Client {
             .await
             .map_err(|_| Error::Timeout)?
             .map_err(|_| Error::RequestCanceled)?;
+        debug!(
+            target: "blazox::client::control",
+            event = "control_request_succeeded",
+            request_id,
+            "control request completed"
+        );
         response.expect_success().map_err(Error::BrokerStatus)
     }
 
@@ -997,8 +1207,21 @@ impl Client {
         if let Some(high_watermark) = self.inner.channel_high_watermark
             && frame.len() as u64 > high_watermark
         {
+            warn!(
+                target: "blazox::client::transport",
+                event = "frame_rejected",
+                frame_len = frame.len(),
+                high_watermark,
+                "frame exceeds configured channel high watermark"
+            );
             return Err(Error::BandwidthLimit);
         }
+        trace!(
+            target: "blazox::client::transport",
+            event = "frame_write_started",
+            frame_len = frame.len(),
+            "writing transport frame"
+        );
         let mut writer = self.inner.writer.lock().await;
         timeout(self.inner.channel_write_timeout, writer.write_all(&frame))
             .await
@@ -1025,6 +1248,7 @@ async fn recv_transport_event(
 }
 
 fn emit_transport_event(client: &Client, event: SessionEvent) {
+    log_transport_event(&event);
     client.inner.events.send(event);
 }
 
@@ -1064,6 +1288,11 @@ fn feature_values<'a>(features: &'a str, field_name: &str) -> Option<Vec<&'a str
 }
 
 async fn read_loop(client: Client, mut reader: OwnedReadHalf) {
+    debug!(
+        target: "blazox::client::transport",
+        event = "read_loop_started",
+        "client read loop started"
+    );
     loop {
         let frame = match read_frame(&mut reader, client.inner.blob_buffer_size).await {
             Ok(frame) => frame,
@@ -1088,6 +1317,13 @@ async fn read_loop(client: Client, mut reader: OwnedReadHalf) {
 
 async fn handle_frame(client: &Client, frame: &[u8]) -> Result<()> {
     let (header, payload) = decode_frame(frame)?;
+    trace!(
+        target: "blazox::client::transport",
+        event = "frame_received",
+        frame_len = frame.len(),
+        event_type = ?header.event_type,
+        "received transport frame"
+    );
     match header.event_type {
         EventType::Control => handle_control_frame(client, header, payload).await,
         EventType::Ack => {
@@ -1189,6 +1425,93 @@ async fn handle_control_frame(client: &Client, header: EventHeader, payload: &[u
         SessionEvent::Schema(InboundSchemaEvent::UnknownJson(value)),
     );
     Ok(())
+}
+
+fn log_transport_event(event: &SessionEvent) {
+    match event {
+        SessionEvent::Schema(schema) => {
+            trace!(
+                target: "blazox::client::schema",
+                event = "schema_event",
+                schema_kind = schema_event_kind(schema),
+                payload = ?schema,
+                "client schema event"
+            );
+        }
+        SessionEvent::Ack(messages) => {
+            debug!(
+                target: "blazox::messages::ack",
+                event = "ack_batch_received",
+                message_count = messages.len(),
+                "received low-level acknowledgement batch"
+            );
+        }
+        SessionEvent::Push(messages) => {
+            debug!(
+                target: "blazox::messages::push",
+                event = "push_batch_received",
+                message_count = messages.len(),
+                "received low-level push batch"
+            );
+        }
+        SessionEvent::HeartbeatRequest => {
+            trace!(
+                target: "blazox::client::transport",
+                event = "heartbeat_request",
+                "received heartbeat request"
+            );
+        }
+        SessionEvent::HeartbeatResponse => {
+            trace!(
+                target: "blazox::client::transport",
+                event = "heartbeat_response",
+                "received heartbeat response"
+            );
+        }
+        SessionEvent::TransportClosed => {
+            info!(
+                target: "blazox::client::transport",
+                event = "transport_closed",
+                "client transport closed"
+            );
+        }
+        SessionEvent::TransportError(error) => {
+            warn!(
+                target: "blazox::client::transport",
+                event = "transport_error",
+                %error,
+                "client transport error"
+            );
+        }
+    }
+}
+
+fn schema_event_kind(event: &InboundSchemaEvent) -> &'static str {
+    match event {
+        InboundSchemaEvent::Control(_) => "control",
+        InboundSchemaEvent::Negotiation(_) => "negotiation",
+        InboundSchemaEvent::Authentication(_) => "authentication",
+        InboundSchemaEvent::UnknownJson(_) => "unknown_json",
+    }
+}
+
+fn control_payload_kind(payload: &ControlPayload) -> &'static str {
+    match payload {
+        ControlPayload::AdminCommand(_) => "admin_command",
+        ControlPayload::AdminCommandResponse(_) => "admin_command_response",
+        ControlPayload::OpenQueue(_) => "open_queue",
+        ControlPayload::OpenQueueResponse(_) => "open_queue_response",
+        ControlPayload::CloseQueue(_) => "close_queue",
+        ControlPayload::CloseQueueResponse(_) => "close_queue_response",
+        ControlPayload::ConfigureQueueStream(_) => "configure_queue_stream",
+        ControlPayload::ConfigureQueueStreamResponse(_) => "configure_queue_stream_response",
+        ControlPayload::ConfigureStream(_) => "configure_stream",
+        ControlPayload::ConfigureStreamResponse(_) => "configure_stream_response",
+        ControlPayload::ClusterMessage(_) => "cluster_message",
+        ControlPayload::Disconnect(_) => "disconnect",
+        ControlPayload::DisconnectResponse(_) => "disconnect_response",
+        ControlPayload::Status(_) => "status",
+    }
 }
 
 async fn read_frame(

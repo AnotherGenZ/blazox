@@ -1,8 +1,8 @@
 mod support;
 
 use blazox::{
-    CompressionAlgorithm, CorrelationIdGenerator, ManualHostHealthMonitor, MessagePropertyValue,
-    EventReceiver, PostMessage, QueueEvent, QueueOptions, Session,
+    CompressionAlgorithm, CorrelationIdGenerator, EventReceiver, ManualHostHealthMonitor,
+    MessagePropertyValue, PostMessage, QueueEvent, QueueOptions, Session,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -876,9 +876,7 @@ async fn session_anonymous_authentication_round_trip() -> TestResult {
     Ok(())
 }
 
-async fn next_queue_event(
-    events: &mut EventReceiver<QueueEvent>,
-) -> TestResult<QueueEvent> {
+async fn next_queue_event(events: &mut EventReceiver<QueueEvent>) -> TestResult<QueueEvent> {
     match timeout(Duration::from_secs(2), events.recv()).await {
         Ok(Ok(event)) => Ok(event),
         Ok(Err(error)) => Err(Box::new(std::io::Error::other(format!(

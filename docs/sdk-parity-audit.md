@@ -75,7 +75,7 @@ This is the Rust-native equivalent of the C++/Java builder and queue APIs.
 - connect, request, open, configure, close, disconnect, linger, and channel-write timeouts
 - event-queue watermarks
 - host health monitor installation
-- distributed trace context and tracer installation
+- structured `tracing` spans around SDK operations
 - consumer flow-control, consumer priority, app id, subscriptions, and host-health suspension policy
 
 The remaining differences here are intentional async-native interpretations, not missing feature support:
@@ -111,8 +111,7 @@ The remaining differences here are intentional async-native interpretations, not
 
 `blazox` now supports:
 
-- operation-level tracing through `TraceSink`
-- distributed trace integration through `DistributedTracer`, `DistributedTraceContext`, and `DistributedTraceSpan`
+- distributed tracing through native `tracing` spans for session operations
 
 This now includes queue metadata baggage on child spans, which is the important feature-semantic match for the documented broker/session flows.
 

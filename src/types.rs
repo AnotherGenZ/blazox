@@ -34,8 +34,6 @@ use tokio::sync::watch;
 
 /// Boxed future returned by an [`AuthProvider`].
 pub type AuthRequestFuture = Pin<Box<dyn Future<Output = Result<AuthenticationRequest>> + Send>>;
-/// Key/value pairs propagated to distributed tracing implementations.
-pub type TraceBaggage = Vec<(String, String)>;
 
 /// Parsed BlazingMQ queue URI.
 ///
@@ -243,93 +241,6 @@ impl HostHealthMonitor for ManualHostHealthMonitor {
     fn subscribe(&self) -> watch::Receiver<HostHealthState> {
         self.tx.subscribe()
     }
-}
-
-/// Operation names emitted to tracing hooks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TraceOperationKind {
-    /// Initial TCP connection and protocol negotiation.
-    Connect,
-    /// Broker authentication exchange.
-    Authenticate,
-    /// Queue open workflow.
-    OpenQueue,
-    /// Queue configure workflow.
-    ConfigureQueue,
-    /// Queue close workflow.
-    CloseQueue,
-    /// Session disconnect workflow.
-    Disconnect,
-    /// Producer publish workflow.
-    Publish,
-    /// Consumer confirmation workflow.
-    Confirm,
-    /// Administrative command execution.
-    AdminCommand,
-}
-
-/// Metadata describing an SDK operation being traced.
-///
-/// The trace hooks in this crate focus on SDK operations rather than arbitrary
-/// spans inside application code.  This keeps the tracing interface small
-/// while still providing enough information to observe queue lifecycle and
-/// publish/confirm traffic.
-#[derive(Debug, Clone)]
-pub struct TraceOperation {
-    /// Operation kind.
-    pub kind: TraceOperationKind,
-    /// Queue targeted by the operation, when applicable.
-    pub queue: Option<Uri>,
-}
-
-/// Lightweight lifecycle tracing sink for SDK operations.
-///
-/// This is the simplest observability integration: the session invokes the
-/// sink whenever a major operation starts, succeeds, or fails.
-pub trait TraceSink: Send + Sync {
-    /// Called when an operation starts.
-    fn operation_started(&self, operation: &TraceOperation);
-    /// Called when an operation completes successfully.
-    fn operation_succeeded(&self, operation: &TraceOperation);
-    /// Called when an operation fails.
-    fn operation_failed(&self, operation: &TraceOperation, error: &Error);
-}
-
-/// Active distributed tracing span.
-///
-/// The trait is intentionally minimal.  It captures the pieces the session
-/// layer needs in order to create child spans around broker operations without
-/// prescribing any particular tracing implementation.
-pub trait DistributedTraceSpan: Send + Sync {
-    /// Returns the span operation name.
-    fn operation(&self) -> &str;
-
-    /// Returns baggage entries that should be propagated to child spans.
-    fn baggage(&self) -> TraceBaggage {
-        TraceBaggage::default()
-    }
-}
-
-/// Activation guard for a distributed tracing span.
-pub trait DistributedTraceScope: Send {}
-
-/// Access to the current distributed tracing context.
-pub trait DistributedTraceContext: Send + Sync {
-    /// Returns the currently active span, if any.
-    fn current_span(&self) -> Option<Arc<dyn DistributedTraceSpan>>;
-    /// Activates a span and returns a scope guard.
-    fn activate_span(&self, span: Arc<dyn DistributedTraceSpan>) -> Box<dyn DistributedTraceScope>;
-}
-
-/// Factory for child spans emitted by SDK operations.
-pub trait DistributedTracer: Send + Sync {
-    /// Creates a child span from the current parent and queue-specific baggage.
-    fn create_child_span(
-        &self,
-        parent: Option<Arc<dyn DistributedTraceSpan>>,
-        operation: &str,
-        baggage: &TraceBaggage,
-    ) -> Option<Arc<dyn DistributedTraceSpan>>;
 }
 
 /// Provider that constructs authentication requests on demand.
@@ -823,12 +734,6 @@ pub struct SessionOptions {
     pub stats_dump_interval: Option<Duration>,
     /// Optional host health monitor installed on the session.
     pub host_health_monitor: Option<Arc<dyn HostHealthMonitor>>,
-    /// Optional trace sink invoked for session operations.
-    pub trace_sink: Option<Arc<dyn TraceSink>>,
-    /// Optional distributed tracing context accessor.
-    pub trace_context: Option<Arc<dyn DistributedTraceContext>>,
-    /// Optional distributed tracing span factory.
-    pub tracer: Option<Arc<dyn DistributedTracer>>,
 }
 
 impl fmt::Debug for SessionOptions {
@@ -888,9 +793,6 @@ impl Default for SessionOptions {
             event_queue_high_watermark: 512,
             stats_dump_interval: None,
             host_health_monitor: None,
-            trace_sink: None,
-            trace_context: None,
-            tracer: None,
         }
     }
 }
@@ -1074,32 +976,6 @@ impl SessionOptions {
         self
     }
 
-    /// Installs an operation trace sink.
-    ///
-    /// Use this for lightweight logging or metrics around SDK operations.
-    pub fn trace_sink(mut self, value: Arc<dyn TraceSink>) -> Self {
-        self.trace_sink = Some(value);
-        self
-    }
-
-    /// Installs a distributed tracing context accessor.
-    ///
-    /// The context is queried whenever the session creates a child span for an
-    /// operation.
-    pub fn trace_context(mut self, value: Arc<dyn DistributedTraceContext>) -> Self {
-        self.trace_context = Some(value);
-        self
-    }
-
-    /// Installs a distributed tracing span factory.
-    ///
-    /// The tracer receives queue-specific baggage so downstream tooling can
-    /// group publish, configure, and confirm operations by queue.
-    pub fn tracer(mut self, value: Arc<dyn DistributedTracer>) -> Self {
-        self.tracer = Some(value);
-        self
-    }
-
     pub(crate) fn to_client_config(&self) -> ClientConfig {
         let mut config = ClientConfig {
             request_timeout: self.request_timeout,
@@ -1125,7 +1001,6 @@ impl SessionOptions {
         }
         config
     }
-
 }
 
 /// Message posted through a [`crate::session::Queue`].

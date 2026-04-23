@@ -8,14 +8,16 @@ use blazox::{
 };
 use std::error::Error as StdError;
 use std::future::Future;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Once};
 use std::time::Duration;
 use tokio::time::timeout;
+use tracing_subscriber::EnvFilter;
 
 pub type TestResult<T = ()> = Result<T, Box<dyn StdError + Send + Sync>>;
 
 static NEXT_QUEUE_ID: AtomicU64 = AtomicU64::new(1);
+static INIT_TRACING: Once = Once::new();
 
 #[derive(Debug, Clone)]
 pub struct LiveBrokerConfig {
@@ -254,7 +256,27 @@ pub async fn blazox_timeout<T>(
 }
 
 pub fn skip_unless_live() -> Option<LiveBrokerConfig> {
-    LiveBrokerConfig::from_env()
+    let config = LiveBrokerConfig::from_env()?;
+    init_test_tracing();
+    Some(config)
+}
+
+pub fn init_test_tracing() {
+    INIT_TRACING.call_once(|| {
+        let filter = EnvFilter::try_from_default_env()
+            .or_else(|_| {
+                let value = std::env::var("BLAZOX_TEST_LOG")
+                    .unwrap_or_else(|_| "blazox=debug,info".to_string());
+                EnvFilter::try_new(value)
+            })
+            .unwrap_or_else(|_| EnvFilter::new("info"));
+
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(true)
+            .with_test_writer()
+            .try_init();
+    });
 }
 
 fn env_flag(name: &str) -> bool {
