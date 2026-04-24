@@ -2457,6 +2457,8 @@ mod tests {
     #[cfg(feature = "trace-propagation")]
     use std::sync::{Arc as StdArc, Mutex as StdMutex, OnceLock};
     #[cfg(feature = "trace-propagation")]
+    use tokio::sync::Mutex as AsyncMutex;
+    #[cfg(feature = "trace-propagation")]
     use tracing::instrument::WithSubscriber;
     #[cfg(feature = "trace-propagation")]
     use tracing::level_filters::LevelFilter;
@@ -2502,9 +2504,9 @@ mod tests {
     }
 
     #[cfg(feature = "trace-propagation")]
-    fn propagation_lock() -> &'static StdMutex<()> {
-        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| StdMutex::new(()))
+    fn propagation_lock() -> &'static AsyncMutex<()> {
+        static LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| AsyncMutex::new(()))
     }
 
     #[test]
@@ -2756,7 +2758,7 @@ mod tests {
     #[cfg(feature = "trace-propagation")]
     #[tokio::test]
     async fn message_trace_propagation_restores_parent_for_received_message() {
-        let _lock = propagation_lock().lock().unwrap();
+        let _lock = propagation_lock().lock().await;
         global::set_text_map_propagator(TextMapCompositePropagator::new(vec![
             Box::new(TraceContextPropagator::new()),
             Box::new(BaggagePropagator::new()),
